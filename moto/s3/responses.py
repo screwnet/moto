@@ -4,9 +4,10 @@ import re
 import sys
 
 import six
+from botocore.awsrequest import AWSPreparedRequest
 
 from moto.core.utils import str_to_rfc_1123_datetime, py2_strip_unicode_keys
-from six.moves.urllib.parse import parse_qs, urlparse, unquote
+from six.moves.urllib.parse import parse_qs, urlparse, unquote, parse_qsl
 
 import xmltodict
 
@@ -23,15 +24,18 @@ from moto.s3bucket_path.utils import (
 
 from .exceptions import (
     BucketAlreadyExists,
+    DuplicateTagKeys,
     S3ClientError,
     MissingBucket,
     MissingKey,
     InvalidPartOrder,
     MalformedXML,
     MalformedACLError,
+    IllegalLocationConstraintException,
     InvalidNotificationARN,
     InvalidNotificationEvent,
     ObjectNotInActiveTierError,
+    NoSystemTags,
 )
 from .models import (
     s3_backend,
@@ -40,9 +44,6 @@ from .models import (
     FakeGrant,
     FakeAcl,
     FakeKey,
-    FakeTagging,
-    FakeTagSet,
-    FakeTag,
 )
 from .utils import (
     bucket_name_from_url,
@@ -122,16 +123,27 @@ ACTION_MAP = {
             "uploadId": "PutObject",
         },
     },
+    "CONTROL": {
+        "GET": {"publicAccessBlock": "GetPublicAccessBlock"},
+        "PUT": {"publicAccessBlock": "PutPublicAccessBlock"},
+        "DELETE": {"publicAccessBlock": "DeletePublicAccessBlock"},
+    },
 }
 
 
 def parse_key_name(pth):
-    return pth.lstrip("/")
+    # strip the first '/' left by urlparse
+    return pth[1:] if pth.startswith("/") else pth
 
 
 def is_delete_keys(request, path, bucket_name):
-    return path == "/?delete" or (
-        path == "/" and getattr(request, "query_string", "") == "delete"
+    # GOlang sends a request as url/?delete= (treating it as a normal key=value, even if the value is empty)
+    # Python sends a request as url/?delete (treating it as a flag)
+    # https://github.com/spulec/moto/issues/2937
+    return (
+        path == "/?delete"
+        or path == "/?delete="
+        or (path == "/" and getattr(request, "query_string", "") == "delete")
     )
 
 
@@ -167,7 +179,7 @@ class ResponseObject(_TemplateEnvironmentMixin, ActionAuthenticatorMixin):
             or host.startswith("localhost")
             or host.startswith("localstack")
             or re.match(r"^[^.]+$", host)
-            or re.match(r"^.*\.svc\.cluster\.local$", host)
+            or re.match(r"^.*\.svc\.cluster\.local:?\d*$", host)
         ):
             # Default to path-based buckets for (1) localhost, (2) localstack hosts (e.g. localstack.dev),
             # (3) local host names that do not contain a "." (e.g., Docker container host names), or
@@ -219,7 +231,7 @@ class ResponseObject(_TemplateEnvironmentMixin, ActionAuthenticatorMixin):
         # Depending on which calling format the client is using, we don't know
         # if this is a bucket or key request so we have to check
         if self.subdomain_based_buckets(request):
-            return self.key_response(request, full_url, headers)
+            return self.key_or_control_response(request, full_url, headers)
         else:
             # Using path-based buckets
             return self.bucket_response(request, full_url, headers)
@@ -286,7 +298,7 @@ class ResponseObject(_TemplateEnvironmentMixin, ActionAuthenticatorMixin):
             return self._bucket_response_post(request, body, bucket_name)
         else:
             raise NotImplementedError(
-                "Method {0} has not been impelemented in the S3 backend yet".format(
+                "Method {0} has not been implemented in the S3 backend yet".format(
                     method
                 )
             )
@@ -370,13 +382,13 @@ class ResponseObject(_TemplateEnvironmentMixin, ActionAuthenticatorMixin):
             template = self.response_template(S3_OBJECT_ACL_RESPONSE)
             return template.render(obj=bucket)
         elif "tagging" in querystring:
-            bucket = self.backend.get_bucket(bucket_name)
+            tags = self.backend.get_bucket_tags(bucket_name)["Tags"]
             # "Special Error" if no tags:
-            if len(bucket.tagging.tag_set.tags) == 0:
+            if len(tags) == 0:
                 template = self.response_template(S3_NO_BUCKET_TAGGING)
                 return 404, {}, template.render(bucket_name=bucket_name)
-            template = self.response_template(S3_BUCKET_TAGGING_RESPONSE)
-            return template.render(bucket=bucket)
+            template = self.response_template(S3_OBJECT_TAGGING_RESPONSE)
+            return template.render(tags=tags)
         elif "logging" in querystring:
             bucket = self.backend.get_bucket(bucket_name)
             if not bucket.logging:
@@ -585,6 +597,29 @@ class ResponseObject(_TemplateEnvironmentMixin, ActionAuthenticatorMixin):
             next_continuation_token = None
         return result_keys, is_truncated, next_continuation_token
 
+    def _body_contains_location_constraint(self, body):
+        if body:
+            try:
+                xmltodict.parse(body)["CreateBucketConfiguration"]["LocationConstraint"]
+                return True
+            except KeyError:
+                pass
+        return False
+
+    def _parse_pab_config(self, body):
+        parsed_xml = xmltodict.parse(body)
+        parsed_xml["PublicAccessBlockConfiguration"].pop("@xmlns", None)
+
+        # If Python 2, fix the unicode strings:
+        if sys.version_info[0] < 3:
+            parsed_xml = {
+                "PublicAccessBlockConfiguration": py2_strip_unicode_keys(
+                    dict(parsed_xml["PublicAccessBlockConfiguration"])
+                )
+            }
+
+        return parsed_xml
+
     def _bucket_response_put(
         self, request, body, region_name, bucket_name, querystring
     ):
@@ -621,7 +656,7 @@ class ResponseObject(_TemplateEnvironmentMixin, ActionAuthenticatorMixin):
             return ""
         elif "tagging" in querystring:
             tagging = self._bucket_tagging_from_xml(body)
-            self.backend.put_bucket_tagging(bucket_name, tagging)
+            self.backend.put_bucket_tags(bucket_name, tagging)
             return ""
         elif "website" in querystring:
             self.backend.set_bucket_website_configuration(bucket_name, body)
@@ -663,27 +698,23 @@ class ResponseObject(_TemplateEnvironmentMixin, ActionAuthenticatorMixin):
                 raise e
 
         elif "publicAccessBlock" in querystring:
-            parsed_xml = xmltodict.parse(body)
-            parsed_xml["PublicAccessBlockConfiguration"].pop("@xmlns", None)
-
-            # If Python 2, fix the unicode strings:
-            if sys.version_info[0] < 3:
-                parsed_xml = {
-                    "PublicAccessBlockConfiguration": py2_strip_unicode_keys(
-                        dict(parsed_xml["PublicAccessBlockConfiguration"])
-                    )
-                }
-
+            pab_config = self._parse_pab_config(body)
             self.backend.put_bucket_public_access_block(
-                bucket_name, parsed_xml["PublicAccessBlockConfiguration"]
+                bucket_name, pab_config["PublicAccessBlockConfiguration"]
             )
             return ""
 
         else:
+            # us-east-1, the default AWS region behaves a bit differently
+            # - you should not use it as a location constraint --> it fails
+            # - querying the location constraint returns None
+            # - LocationConstraint has to be specified if outside us-east-1
+            if (
+                region_name != DEFAULT_REGION_NAME
+                and not self._body_contains_location_constraint(body)
+            ):
+                raise IllegalLocationConstraintException()
             if body:
-                # us-east-1, the default AWS region behaves a bit differently
-                # - you should not use it as a location constraint --> it fails
-                # - querying the location constraint returns None
                 try:
                     forced_region = xmltodict.parse(body)["CreateBucketConfiguration"][
                         "LocationConstraint"
@@ -750,6 +781,7 @@ class ResponseObject(_TemplateEnvironmentMixin, ActionAuthenticatorMixin):
             return 409, {}, template.render(bucket=removed_bucket)
 
     def _bucket_response_post(self, request, body, bucket_name):
+        response_headers = {}
         if not request.headers.get("Content-Length"):
             return 411, {}, "Content-Length required"
 
@@ -771,11 +803,7 @@ class ResponseObject(_TemplateEnvironmentMixin, ActionAuthenticatorMixin):
         else:
             # HTTPretty, build new form object
             body = body.decode()
-
-            form = {}
-            for kv in body.split("&"):
-                k, v = kv.split("=")
-                form[k] = v
+            form = dict(parse_qsl(body))
 
         key = form["key"]
         if "file" in form:
@@ -783,13 +811,23 @@ class ResponseObject(_TemplateEnvironmentMixin, ActionAuthenticatorMixin):
         else:
             f = request.files["file"].stream.read()
 
+        if "success_action_redirect" in form:
+            response_headers["Location"] = form["success_action_redirect"]
+
+        if "success_action_status" in form:
+            status_code = form["success_action_status"]
+        elif "success_action_redirect" in form:
+            status_code = 303
+        else:
+            status_code = 204
+
         new_key = self.backend.set_key(bucket_name, key, f)
 
         # Metadata
         metadata = metadata_from_headers(form)
         new_key.set_metadata(metadata)
 
-        return 200, {}, ""
+        return status_code, response_headers, ""
 
     @staticmethod
     def _get_path(request):
@@ -805,27 +843,35 @@ class ResponseObject(_TemplateEnvironmentMixin, ActionAuthenticatorMixin):
 
     def _bucket_response_delete_keys(self, request, body, bucket_name):
         template = self.response_template(S3_DELETE_KEYS_RESPONSE)
+        body_dict = xmltodict.parse(body)
 
-        keys = minidom.parseString(body).getElementsByTagName("Key")
-        deleted_names = []
-        error_names = []
-        if len(keys) == 0:
+        objects = body_dict["Delete"].get("Object", [])
+        if not isinstance(objects, list):
+            # We expect a list of objects, but when there is a single <Object> node xmltodict does not
+            # return a list.
+            objects = [objects]
+        if len(objects) == 0:
             raise MalformedXML()
 
-        for k in keys:
-            key_name = k.firstChild.nodeValue
+        deleted_objects = []
+        error_names = []
+
+        for object_ in objects:
+            key_name = object_["Key"]
+            version_id = object_.get("VersionId", None)
+
             success = self.backend.delete_key(
-                bucket_name, undo_clean_key_name(key_name)
+                bucket_name, undo_clean_key_name(key_name), version_id=version_id
             )
             if success:
-                deleted_names.append(key_name)
+                deleted_objects.append((key_name, version_id))
             else:
                 error_names.append(key_name)
 
         return (
             200,
             {},
-            template.render(deleted=deleted_names, delete_errors=error_names),
+            template.render(deleted=deleted_objects, delete_errors=error_names),
         )
 
     def _handle_range_header(self, request, headers, response_content):
@@ -854,15 +900,21 @@ class ResponseObject(_TemplateEnvironmentMixin, ActionAuthenticatorMixin):
         )
         return 206, response_headers, response_content[begin : end + 1]
 
-    def key_response(self, request, full_url, headers):
+    def key_or_control_response(self, request, full_url, headers):
+        # Key and Control are lumped in because splitting out the regex is too much of a pain :/
         self.method = request.method
         self.path = self._get_path(request)
         self.headers = request.headers
         if "host" not in self.headers:
             self.headers["host"] = urlparse(full_url).netloc
         response_headers = {}
+
         try:
-            response = self._key_response(request, full_url, headers)
+            # Is this an S3 control response?
+            if isinstance(request, AWSPreparedRequest) and "s3-control" in request.url:
+                response = self._control_response(request, full_url, headers)
+            else:
+                response = self._key_response(request, full_url, headers)
         except S3ClientError as s3error:
             response = s3error.code, {}, s3error.description
 
@@ -877,6 +929,94 @@ class ResponseObject(_TemplateEnvironmentMixin, ActionAuthenticatorMixin):
                 request, response_headers, response_content
             )
         return status_code, response_headers, response_content
+
+    def _control_response(self, request, full_url, headers):
+        parsed_url = urlparse(full_url)
+        query = parse_qs(parsed_url.query, keep_blank_values=True)
+        method = request.method
+
+        if hasattr(request, "body"):
+            # Boto
+            body = request.body
+            if hasattr(body, "read"):
+                body = body.read()
+        else:
+            # Flask server
+            body = request.data
+        if body is None:
+            body = b""
+
+        if method == "GET":
+            return self._control_response_get(request, query, headers)
+        elif method == "PUT":
+            return self._control_response_put(request, body, query, headers)
+        elif method == "DELETE":
+            return self._control_response_delete(request, query, headers)
+        else:
+            raise NotImplementedError(
+                "Method {0} has not been implemented in the S3 backend yet".format(
+                    method
+                )
+            )
+
+    def _control_response_get(self, request, query, headers):
+        action = self.path.split("?")[0].split("/")[
+            -1
+        ]  # Gets the action out of the URL sans query params.
+        self._set_action("CONTROL", "GET", action)
+        self._authenticate_and_authorize_s3_action()
+
+        response_headers = {}
+        if "publicAccessBlock" in action:
+            public_block_config = self.backend.get_account_public_access_block(
+                headers["x-amz-account-id"]
+            )
+            template = self.response_template(S3_PUBLIC_ACCESS_BLOCK_CONFIGURATION)
+            return (
+                200,
+                response_headers,
+                template.render(public_block_config=public_block_config),
+            )
+
+        raise NotImplementedError(
+            "Method {0} has not been implemented in the S3 backend yet".format(action)
+        )
+
+    def _control_response_put(self, request, body, query, headers):
+        action = self.path.split("?")[0].split("/")[
+            -1
+        ]  # Gets the action out of the URL sans query params.
+        self._set_action("CONTROL", "PUT", action)
+        self._authenticate_and_authorize_s3_action()
+
+        response_headers = {}
+        if "publicAccessBlock" in action:
+            pab_config = self._parse_pab_config(body)
+            self.backend.put_account_public_access_block(
+                headers["x-amz-account-id"],
+                pab_config["PublicAccessBlockConfiguration"],
+            )
+            return 200, response_headers, ""
+
+        raise NotImplementedError(
+            "Method {0} has not been implemented in the S3 backend yet".format(action)
+        )
+
+    def _control_response_delete(self, request, query, headers):
+        action = self.path.split("?")[0].split("/")[
+            -1
+        ]  # Gets the action out of the URL sans query params.
+        self._set_action("CONTROL", "DELETE", action)
+        self._authenticate_and_authorize_s3_action()
+
+        response_headers = {}
+        if "publicAccessBlock" in action:
+            self.backend.delete_account_public_access_block(headers["x-amz-account-id"])
+            return 200, response_headers, ""
+
+        raise NotImplementedError(
+            "Method {0} has not been implemented in the S3 backend yet".format(action)
+        )
 
     def _key_response(self, request, full_url, headers):
         parsed_url = urlparse(full_url)
@@ -970,8 +1110,9 @@ class ResponseObject(_TemplateEnvironmentMixin, ActionAuthenticatorMixin):
             template = self.response_template(S3_OBJECT_ACL_RESPONSE)
             return 200, response_headers, template.render(obj=key)
         if "tagging" in query:
+            tags = self.backend.get_key_tags(key)["Tags"]
             template = self.response_template(S3_OBJECT_TAGGING_RESPONSE)
-            return 200, response_headers, template.render(obj=key)
+            return 200, response_headers, template.render(tags=tags)
 
         response_headers.update(key.metadata)
         response_headers.update(key.response_dict)
@@ -1043,8 +1184,9 @@ class ResponseObject(_TemplateEnvironmentMixin, ActionAuthenticatorMixin):
                 version_id = query["versionId"][0]
             else:
                 version_id = None
+            key = self.backend.get_key(bucket_name, key_name, version_id=version_id)
             tagging = self._tagging_from_xml(body)
-            self.backend.set_key_tagging(bucket_name, key_name, tagging, version_id)
+            self.backend.set_key_tags(key, tagging, key_name)
             return 200, response_headers, ""
 
         if "x-amz-copy-source" in request.headers:
@@ -1082,6 +1224,10 @@ class ResponseObject(_TemplateEnvironmentMixin, ActionAuthenticatorMixin):
             if mdirective is not None and mdirective == "REPLACE":
                 metadata = metadata_from_headers(request.headers)
                 new_key.set_metadata(metadata, replace=True)
+            tdirective = request.headers.get("x-amz-tagging-directive")
+            if tdirective == "REPLACE":
+                tagging = self._tagging_from_headers(request.headers)
+                self.backend.set_key_tags(new_key, tagging)
             template = self.response_template(S3_OBJECT_COPY_RESPONSE)
             response_headers.update(new_key.response_dict)
             return 200, response_headers, template.render(key=new_key)
@@ -1105,11 +1251,10 @@ class ResponseObject(_TemplateEnvironmentMixin, ActionAuthenticatorMixin):
             new_key.website_redirect_location = request.headers.get(
                 "x-amz-website-redirect-location"
             )
-            new_key.set_tagging(tagging)
+            self.backend.set_key_tags(new_key, tagging)
 
-        template = self.response_template(S3_OBJECT_RESPONSE)
         response_headers.update(new_key.response_dict)
-        return 200, response_headers, template.render(key=new_key)
+        return 200, response_headers, ""
 
     def _key_response_head(self, bucket_name, query, key_name, headers):
         response_headers = {}
@@ -1234,50 +1379,45 @@ class ResponseObject(_TemplateEnvironmentMixin, ActionAuthenticatorMixin):
             return None
 
     def _tagging_from_headers(self, headers):
+        tags = {}
         if headers.get("x-amz-tagging"):
             parsed_header = parse_qs(headers["x-amz-tagging"], keep_blank_values=True)
-            tags = []
             for tag in parsed_header.items():
-                tags.append(FakeTag(tag[0], tag[1][0]))
-
-            tag_set = FakeTagSet(tags)
-            tagging = FakeTagging(tag_set)
-            return tagging
-        else:
-            return FakeTagging()
+                tags[tag[0]] = tag[1][0]
+        return tags
 
     def _tagging_from_xml(self, xml):
         parsed_xml = xmltodict.parse(xml, force_list={"Tag": True})
 
-        tags = []
+        tags = {}
         for tag in parsed_xml["Tagging"]["TagSet"]["Tag"]:
-            tags.append(FakeTag(tag["Key"], tag["Value"]))
+            tags[tag["Key"]] = tag["Value"]
 
-        tag_set = FakeTagSet(tags)
-        tagging = FakeTagging(tag_set)
-        return tagging
+        return tags
 
     def _bucket_tagging_from_xml(self, xml):
         parsed_xml = xmltodict.parse(xml)
 
-        tags = []
+        tags = {}
         # Optional if no tags are being sent:
         if parsed_xml["Tagging"].get("TagSet"):
             # If there is only 1 tag, then it's not a list:
             if not isinstance(parsed_xml["Tagging"]["TagSet"]["Tag"], list):
-                tags.append(
-                    FakeTag(
-                        parsed_xml["Tagging"]["TagSet"]["Tag"]["Key"],
-                        parsed_xml["Tagging"]["TagSet"]["Tag"]["Value"],
-                    )
-                )
+                tags[parsed_xml["Tagging"]["TagSet"]["Tag"]["Key"]] = parsed_xml[
+                    "Tagging"
+                ]["TagSet"]["Tag"]["Value"]
             else:
                 for tag in parsed_xml["Tagging"]["TagSet"]["Tag"]:
-                    tags.append(FakeTag(tag["Key"], tag["Value"]))
+                    if tag["Key"] in tags:
+                        raise DuplicateTagKeys()
+                    tags[tag["Key"]] = tag["Value"]
 
-        tag_set = FakeTagSet(tags)
-        tagging = FakeTagging(tag_set)
-        return tagging
+        # Verify that "aws:" is not in the tags. If so, then this is a problem:
+        for key, _ in tags.items():
+            if key.startswith("aws:"):
+                raise NoSystemTags()
+
+        return tags
 
     def _cors_from_xml(self, xml):
         parsed_xml = xmltodict.parse(xml)
@@ -1422,8 +1562,7 @@ class ResponseObject(_TemplateEnvironmentMixin, ActionAuthenticatorMixin):
             return 204, {}, ""
         version_id = query.get("versionId", [None])[0]
         self.backend.delete_key(bucket_name, key_name, version_id=version_id)
-        template = self.response_template(S3_DELETE_OBJECT_SUCCESS)
-        return 204, {}, template.render()
+        return 204, {}, ""
 
     def _complete_multipart_body(self, body):
         ps = minidom.parseString(body).getElementsByTagName("Part")
@@ -1482,7 +1621,7 @@ S3_ALL_BUCKETS = """<ListAllMyBucketsResult xmlns="http://s3.amazonaws.com/doc/2
     {% for bucket in buckets %}
       <Bucket>
         <Name>{{ bucket.name }}</Name>
-        <CreationDate>{{ bucket.creation_date }}</CreationDate>
+        <CreationDate>{{ bucket.creation_date.isoformat() }}</CreationDate>
       </Bucket>
     {% endfor %}
  </Buckets>
@@ -1598,10 +1737,10 @@ S3_BUCKET_LIFECYCLE_CONFIGURATION = """<?xml version="1.0" encoding="UTF-8"?>
             {% if rule.filter.prefix != None %}
             <Prefix>{{ rule.filter.prefix }}</Prefix>
             {% endif %}
-            {% if rule.filter.tag %}
+            {% if rule.filter.tag_key %}
             <Tag>
-                <Key>{{ rule.filter.tag.key }}</Key>
-                <Value>{{ rule.filter.tag.value }}</Value>
+                <Key>{{ rule.filter.tag_key }}</Key>
+                <Value>{{ rule.filter.tag_value }}</Value>
             </Tag>
             {% endif %}
             {% if rule.filter.and_filter %}
@@ -1609,10 +1748,10 @@ S3_BUCKET_LIFECYCLE_CONFIGURATION = """<?xml version="1.0" encoding="UTF-8"?>
                 {% if rule.filter.and_filter.prefix != None %}
                 <Prefix>{{ rule.filter.and_filter.prefix }}</Prefix>
                 {% endif %}
-                {% for tag in rule.filter.and_filter.tags %}
+                {% for key, value in rule.filter.and_filter.tags.items() %}
                 <Tag>
-                    <Key>{{ tag.key }}</Key>
-                    <Value>{{ tag.value }}</Value>
+                    <Key>{{ key }}</Key>
+                    <Value>{{ value }}</Value>
                 </Tag>
                 {% endfor %}
             </And>
@@ -1726,9 +1865,10 @@ S3_BUCKET_GET_VERSIONS = """<?xml version="1.0" encoding="UTF-8"?>
 
 S3_DELETE_KEYS_RESPONSE = """<?xml version="1.0" encoding="UTF-8"?>
 <DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01">
-{% for k in deleted %}
+{% for k, v in deleted %}
 <Deleted>
 <Key>{{k}}</Key>
+{% if v %}<VersionId>{{v}}</VersionId>{% endif %}
 </Deleted>
 {% endfor %}
 {% for k in delete_errors %}
@@ -1737,20 +1877,6 @@ S3_DELETE_KEYS_RESPONSE = """<?xml version="1.0" encoding="UTF-8"?>
 </Error>
 {% endfor %}
 </DeleteResult>"""
-
-S3_DELETE_OBJECT_SUCCESS = """<DeleteObjectResponse xmlns="http://s3.amazonaws.com/doc/2006-03-01">
-  <DeleteObjectResponse>
-    <Code>200</Code>
-    <Description>OK</Description>
-  </DeleteObjectResponse>
-</DeleteObjectResponse>"""
-
-S3_OBJECT_RESPONSE = """<PutObjectResponse xmlns="http://s3.amazonaws.com/doc/2006-03-01">
-      <PutObjectResponse>
-        <ETag>{{ key.etag }}</ETag>
-        <LastModified>{{ key.last_modified_ISO8601 }}</LastModified>
-      </PutObjectResponse>
-    </PutObjectResponse>"""
 
 S3_OBJECT_ACL_RESPONSE = """<?xml version="1.0" encoding="UTF-8"?>
     <AccessControlPolicy xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
@@ -1787,22 +1913,10 @@ S3_OBJECT_TAGGING_RESPONSE = """\
 <?xml version="1.0" encoding="UTF-8"?>
 <Tagging xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
   <TagSet>
-    {% for tag in obj.tagging.tag_set.tags %}
+    {% for tag in tags %}
     <Tag>
-      <Key>{{ tag.key }}</Key>
-      <Value>{{ tag.value }}</Value>
-    </Tag>
-    {% endfor %}
-  </TagSet>
-</Tagging>"""
-
-S3_BUCKET_TAGGING_RESPONSE = """<?xml version="1.0" encoding="UTF-8"?>
-<Tagging>
-  <TagSet>
-    {% for tag in bucket.tagging.tag_set.tags %}
-    <Tag>
-      <Key>{{ tag.key }}</Key>
-      <Value>{{ tag.value }}</Value>
+      <Key>{{ tag.Key }}</Key>
+      <Value>{{ tag.Value }}</Value>
     </Tag>
     {% endfor %}
   </TagSet>
@@ -1869,7 +1983,6 @@ S3_MULTIPART_LIST_RESPONSE = """<?xml version="1.0" encoding="UTF-8"?>
     <ID>75aa57f09aa0c8caeab4f8c24e99d10f8e7faeebf76c078efc7c6caea54ba06a</ID>
     <DisplayName>webfile</DisplayName>
   </Owner>
-  <StorageClass>STANDARD</StorageClass>
   <PartNumberMarker>1</PartNumberMarker>
   <NextPartNumberMarker>{{ count }}</NextPartNumberMarker>
   <MaxParts>{{ count }}</MaxParts>

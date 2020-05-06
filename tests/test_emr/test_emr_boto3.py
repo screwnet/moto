@@ -60,6 +60,15 @@ input_instance_groups = [
         "Market": "SPOT",
         "Name": "task-2",
         "BidPrice": "0.05",
+        "EbsConfiguration": {
+            "EbsBlockDeviceConfigs": [
+                {
+                    "VolumeSpecification": {"VolumeType": "gp2", "SizeInGB": 800},
+                    "VolumesPerInstance": 6,
+                },
+            ],
+            "EbsOptimized": True,
+        },
     },
 ]
 
@@ -430,6 +439,21 @@ def test_run_job_flow_with_visible_to_all_users():
         resp["Cluster"]["VisibleToAllUsers"].should.equal(expected)
 
 
+def _do_assertion_ebs_configuration(x, y):
+    total_volumes = 0
+    total_size = 0
+    for ebs_block in y["EbsConfiguration"]["EbsBlockDeviceConfigs"]:
+        total_volumes += ebs_block["VolumesPerInstance"]
+        total_size += ebs_block["VolumeSpecification"]["SizeInGB"]
+    # Multiply by total volumes
+    total_size = total_size * total_volumes
+    comp_total_size = 0
+    for ebs_block in x["EbsBlockDevices"]:
+        comp_total_size += ebs_block["VolumeSpecification"]["SizeInGB"]
+    len(x["EbsBlockDevices"]).should.equal(total_volumes)
+    comp_total_size.should.equal(comp_total_size)
+
+
 @mock_emr
 def test_run_job_flow_with_instance_groups():
     input_groups = dict((g["Name"], g) for g in input_instance_groups)
@@ -447,6 +471,9 @@ def test_run_job_flow_with_instance_groups():
         x["Market"].should.equal(y["Market"])
         if "BidPrice" in y:
             x["BidPrice"].should.equal(y["BidPrice"])
+
+        if "EbsConfiguration" in y:
+            _do_assertion_ebs_configuration(x, y)
 
 
 @mock_emr
@@ -623,6 +650,8 @@ def test_instance_groups():
         y = input_groups[x["Name"]]
         if hasattr(y, "BidPrice"):
             x["BidPrice"].should.equal("BidPrice")
+        if "EbsConfiguration" in y:
+            _do_assertion_ebs_configuration(x, y)
         # Configurations
         # EbsBlockDevices
         # EbsOptimized
@@ -752,7 +781,9 @@ def test_steps():
         # StateChangeReason
         x["Status"]["Timeline"]["CreationDateTime"].should.be.a("datetime.datetime")
         # x['Status']['Timeline']['EndDateTime'].should.be.a('datetime.datetime')
-        # x['Status']['Timeline']['StartDateTime'].should.be.a('datetime.datetime')
+        # Only the first step will have started - we don't know anything about when it finishes, so the second step never starts
+        if x["Name"] == "My wordcount example":
+            x["Status"]["Timeline"]["StartDateTime"].should.be.a("datetime.datetime")
 
         x = client.describe_step(ClusterId=cluster_id, StepId=x["Id"])["Step"]
         x["ActionOnFailure"].should.equal("TERMINATE_CLUSTER")

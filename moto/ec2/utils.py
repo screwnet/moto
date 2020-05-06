@@ -10,8 +10,6 @@ import six
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.asymmetric import rsa
-import sshpubkeys.exceptions
-from sshpubkeys.keys import SSHKey
 
 
 EC2_RESOURCE_TO_PREFIX = {
@@ -183,6 +181,10 @@ def random_ip():
     )
 
 
+def randor_ipv4_cidr():
+    return "10.0.{}.{}/16".format(random.randint(0, 255), random.randint(0, 255))
+
+
 def random_ipv6_cidr():
     return "2400:6500:{}:{}::/56".format(random_resource_id(4), random_resource_id(4))
 
@@ -191,25 +193,22 @@ def generate_route_id(route_table_id, cidr_block):
     return "%s~%s" % (route_table_id, cidr_block)
 
 
+def generate_vpc_end_point_id(vpc_id):
+    return "%s-%s" % ("vpce", vpc_id[4:])
+
+
+def create_dns_entries(service_name, vpc_endpoint_id):
+    dns_entries = {}
+    dns_entries["dns_name"] = "{}-{}.{}".format(
+        vpc_endpoint_id, random_resource_id(8), service_name
+    )
+    dns_entries["hosted_zone_id"] = random_resource_id(13).upper()
+    return dns_entries
+
+
 def split_route_id(route_id):
     values = route_id.split("~")
     return values[0], values[1]
-
-
-def tags_from_query_string(querystring_dict):
-    prefix = "Tag"
-    suffix = "Key"
-    response_values = {}
-    for key, value in querystring_dict.items():
-        if key.startswith(prefix) and key.endswith(suffix):
-            tag_index = key.replace(prefix + ".", "").replace("." + suffix, "")
-            tag_key = querystring_dict.get("Tag.{0}.Key".format(tag_index))[0]
-            tag_value_key = "Tag.{0}.Value".format(tag_index)
-            if tag_value_key in querystring_dict:
-                response_values[tag_key] = querystring_dict.get(tag_value_key)[0]
-            else:
-                response_values[tag_key] = None
-    return response_values
 
 
 def dhcp_configuration_from_querystring(querystring, option="DhcpConfiguration"):
@@ -252,7 +251,8 @@ def dhcp_configuration_from_querystring(querystring, option="DhcpConfiguration")
 
 def filters_from_querystring(querystring_dict):
     response_values = {}
-    for key, value in querystring_dict.items():
+    last_tag_key = None
+    for key, value in sorted(querystring_dict.items()):
         match = re.search(r"Filter.(\d).Name", key)
         if match:
             filter_index = match.groups()[0]
@@ -262,6 +262,10 @@ def filters_from_querystring(querystring_dict):
                 for filter_key, filter_value in querystring_dict.items()
                 if filter_key.startswith(value_prefix)
             ]
+            if value[0] == "tag-key":
+                last_tag_key = "tag:" + filter_values[0]
+            elif last_tag_key and value[0] == "tag-value":
+                response_values[last_tag_key] = filter_values
             response_values[value[0]] = filter_values
     return response_values
 
@@ -328,6 +332,8 @@ def tag_filter_matches(obj, filter_name, filter_values):
     if filter_name == "tag-key":
         tag_values = get_obj_tag_names(obj)
     elif filter_name == "tag-value":
+        tag_values = get_obj_tag_values(obj)
+    elif filter_name.startswith("tag:"):
         tag_values = get_obj_tag_values(obj)
     else:
         tag_values = [get_obj_tag(obj, filter_name) or ""]
@@ -553,6 +559,10 @@ def generate_instance_identity_document(instance):
 
 
 def rsa_public_key_parse(key_material):
+    # These imports take ~.5s; let's keep them local
+    import sshpubkeys.exceptions
+    from sshpubkeys.keys import SSHKey
+
     try:
         if not isinstance(key_material, six.binary_type):
             key_material = key_material.encode("ascii")

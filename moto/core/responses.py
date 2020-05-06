@@ -11,7 +11,6 @@ import requests
 
 import pytz
 
-from moto.core.access_control import IAMRequest, S3IAMRequest
 from moto.core.exceptions import DryRunClientError
 
 from jinja2 import Environment, DictLoader, TemplateNotFound
@@ -20,7 +19,6 @@ import six
 from six.moves.urllib.parse import parse_qs, urlparse
 
 import xmltodict
-from pkg_resources import resource_filename
 from werkzeug.exceptions import HTTPException
 
 import boto3
@@ -135,9 +133,13 @@ class ActionAuthenticatorMixin(object):
             ActionAuthenticatorMixin.request_count += 1
 
     def _authenticate_and_authorize_normal_action(self):
+        from moto.iam.access_control import IAMRequest
+
         self._authenticate_and_authorize_action(IAMRequest)
 
     def _authenticate_and_authorize_s3_action(self):
+        from moto.iam.access_control import S3IAMRequest
+
         self._authenticate_and_authorize_action(S3IAMRequest)
 
     @staticmethod
@@ -766,6 +768,9 @@ class AWSServiceSpec(object):
     """
 
     def __init__(self, path):
+        # Importing pkg_resources takes ~60ms; keep it local
+        from pkg_resources import resource_filename  # noqa
+
         self.path = resource_filename("botocore", path)
         with io.open(self.path, "r", encoding="utf-8") as f:
             spec = json.load(f)

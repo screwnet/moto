@@ -183,12 +183,12 @@ def test_start_database():
 
 
 @mock_rds2
-def test_fail_to_stop_multi_az():
+def test_fail_to_stop_multi_az_and_sqlserver():
     conn = boto3.client("rds", region_name="us-west-2")
     database = conn.create_db_instance(
         DBInstanceIdentifier="db-master-1",
         AllocatedStorage=10,
-        Engine="postgres",
+        Engine="sqlserver-ee",
         DBName="staging-postgres",
         DBInstanceClass="db.m1.small",
         LicenseModel="license-included",
@@ -211,6 +211,33 @@ def test_fail_to_stop_multi_az():
     conn.start_db_instance.when.called_with(
         DBInstanceIdentifier=mydb["DBInstanceIdentifier"]
     ).should.throw(ClientError)
+
+
+@mock_rds2
+def test_stop_multi_az_postgres():
+    conn = boto3.client("rds", region_name="us-west-2")
+    database = conn.create_db_instance(
+        DBInstanceIdentifier="db-master-1",
+        AllocatedStorage=10,
+        Engine="postgres",
+        DBName="staging-postgres",
+        DBInstanceClass="db.m1.small",
+        LicenseModel="license-included",
+        MasterUsername="root",
+        MasterUserPassword="hunter2",
+        Port=1234,
+        DBSecurityGroups=["my_sg"],
+        MultiAZ=True,
+    )
+
+    mydb = conn.describe_db_instances(
+        DBInstanceIdentifier=database["DBInstance"]["DBInstanceIdentifier"]
+    )["DBInstances"][0]
+    mydb["DBInstanceStatus"].should.equal("available")
+
+    response = conn.stop_db_instance(DBInstanceIdentifier=mydb["DBInstanceIdentifier"])
+    response["ResponseMetadata"]["HTTPStatusCode"].should.equal(200)
+    response["DBInstance"]["DBInstanceStatus"].should.equal("stopped")
 
 
 @mock_rds2
@@ -312,7 +339,7 @@ def test_get_databases_paginated():
 
 
 @mock_rds2
-def test_describe_non_existant_database():
+def test_describe_non_existent_database():
     conn = boto3.client("rds", region_name="us-west-2")
     conn.describe_db_instances.when.called_with(
         DBInstanceIdentifier="not-a-db"
@@ -378,7 +405,7 @@ def test_rename_db_instance():
 
 
 @mock_rds2
-def test_modify_non_existant_database():
+def test_modify_non_existent_database():
     conn = boto3.client("rds", region_name="us-west-2")
     conn.modify_db_instance.when.called_with(
         DBInstanceIdentifier="not-a-db", AllocatedStorage=20, ApplyImmediately=True
@@ -403,7 +430,7 @@ def test_reboot_db_instance():
 
 
 @mock_rds2
-def test_reboot_non_existant_database():
+def test_reboot_non_existent_database():
     conn = boto3.client("rds", region_name="us-west-2")
     conn.reboot_db_instance.when.called_with(
         DBInstanceIdentifier="not-a-db"
@@ -444,7 +471,7 @@ def test_delete_database():
 
 
 @mock_rds2
-def test_delete_non_existant_database():
+def test_delete_non_existent_database():
     conn = boto3.client("rds2", region_name="us-west-2")
     conn.delete_db_instance.when.called_with(
         DBInstanceIdentifier="not-a-db"
@@ -663,7 +690,7 @@ def test_describe_option_group():
 
 
 @mock_rds2
-def test_describe_non_existant_option_group():
+def test_describe_non_existent_option_group():
     conn = boto3.client("rds", region_name="us-west-2")
     conn.describe_option_groups.when.called_with(
         OptionGroupName="not-a-option-group"
@@ -688,10 +715,10 @@ def test_delete_option_group():
 
 
 @mock_rds2
-def test_delete_non_existant_option_group():
+def test_delete_non_existent_option_group():
     conn = boto3.client("rds", region_name="us-west-2")
     conn.delete_option_group.when.called_with(
-        OptionGroupName="non-existant"
+        OptionGroupName="non-existent"
     ).should.throw(ClientError)
 
 
@@ -754,10 +781,10 @@ def test_modify_option_group_no_options():
 
 
 @mock_rds2
-def test_modify_non_existant_option_group():
+def test_modify_non_existent_option_group():
     conn = boto3.client("rds", region_name="us-west-2")
     conn.modify_option_group.when.called_with(
-        OptionGroupName="non-existant",
+        OptionGroupName="non-existent",
         OptionsToInclude=[
             (
                 "OptionName",
@@ -771,7 +798,7 @@ def test_modify_non_existant_option_group():
 
 
 @mock_rds2
-def test_delete_non_existant_database():
+def test_delete_non_existent_database():
     conn = boto3.client("rds", region_name="us-west-2")
     conn.delete_db_instance.when.called_with(
         DBInstanceIdentifier="not-a-db"
@@ -1053,7 +1080,7 @@ def test_get_security_groups():
 
 
 @mock_rds2
-def test_get_non_existant_security_group():
+def test_get_non_existent_security_group():
     conn = boto3.client("rds", region_name="us-west-2")
     conn.describe_db_security_groups.when.called_with(
         DBSecurityGroupName="not-a-sg"
@@ -1076,7 +1103,7 @@ def test_delete_database_security_group():
 
 
 @mock_rds2
-def test_delete_non_existant_security_group():
+def test_delete_non_existent_security_group():
     conn = boto3.client("rds", region_name="us-west-2")
     conn.delete_db_security_group.when.called_with(
         DBSecurityGroupName="not-a-db"
@@ -1615,7 +1642,7 @@ def test_describe_db_parameter_group():
 
 
 @mock_rds2
-def test_describe_non_existant_db_parameter_group():
+def test_describe_non_existent_db_parameter_group():
     conn = boto3.client("rds", region_name="us-west-2")
     db_parameter_groups = conn.describe_db_parameter_groups(DBParameterGroupName="test")
     len(db_parameter_groups["DBParameterGroups"]).should.equal(0)
@@ -1669,10 +1696,10 @@ def test_modify_db_parameter_group():
 
 
 @mock_rds2
-def test_delete_non_existant_db_parameter_group():
+def test_delete_non_existent_db_parameter_group():
     conn = boto3.client("rds", region_name="us-west-2")
     conn.delete_db_parameter_group.when.called_with(
-        DBParameterGroupName="non-existant"
+        DBParameterGroupName="non-existent"
     ).should.throw(ClientError)
 
 
@@ -1689,3 +1716,36 @@ def test_create_parameter_group_with_tags():
         ResourceName="arn:aws:rds:us-west-2:1234567890:pg:test"
     )
     result["TagList"].should.equal([{"Value": "bar", "Key": "foo"}])
+
+
+@mock_rds2
+def test_create_db_with_iam_authentication():
+    conn = boto3.client("rds", region_name="us-west-2")
+
+    database = conn.create_db_instance(
+        DBInstanceIdentifier="rds",
+        DBInstanceClass="db.t1.micro",
+        Engine="postgres",
+        EnableIAMDatabaseAuthentication=True,
+    )
+
+    db_instance = database["DBInstance"]
+    db_instance["IAMDatabaseAuthenticationEnabled"].should.equal(True)
+
+
+@mock_rds2
+def test_create_db_snapshot_with_iam_authentication():
+    conn = boto3.client("rds", region_name="us-west-2")
+
+    conn.create_db_instance(
+        DBInstanceIdentifier="rds",
+        DBInstanceClass="db.t1.micro",
+        Engine="postgres",
+        EnableIAMDatabaseAuthentication=True,
+    )
+
+    snapshot = conn.create_db_snapshot(
+        DBInstanceIdentifier="rds", DBSnapshotIdentifier="snapshot"
+    ).get("DBSnapshot")
+
+    snapshot.get("IAMDatabaseAuthenticationEnabled").should.equal(True)

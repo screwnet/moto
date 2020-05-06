@@ -7,10 +7,13 @@ import inspect
 import os
 import re
 import six
+import types
 from io import BytesIO
 from collections import defaultdict
 from botocore.handlers import BUILTIN_HANDLERS
 from botocore.awsrequest import AWSResponse
+from six.moves.urllib.parse import urlparse
+from werkzeug.wrappers import Request
 
 import mock
 from moto import settings
@@ -30,14 +33,15 @@ class BaseMockAWS(object):
     nested_count = 0
 
     def __init__(self, backends):
+        from moto.instance_metadata import instance_metadata_backend
+        from moto.core import moto_api_backend
+
         self.backends = backends
 
         self.backends_for_urls = {}
-        from moto.backends import BACKENDS
-
         default_backends = {
-            "instance_metadata": BACKENDS["instance_metadata"]["global"],
-            "moto_api": BACKENDS["moto_api"]["global"],
+            "instance_metadata": instance_metadata_backend,
+            "moto_api": moto_api_backend,
         }
         self.backends_for_urls.update(self.backends)
         self.backends_for_urls.update(default_backends)
@@ -174,6 +178,26 @@ class CallbackResponse(responses.CallbackResponse):
         """
         Need to override this so we can pass decode_content=False
         """
+        if not isinstance(request, Request):
+            url = urlparse(request.url)
+            if request.body is None:
+                body = None
+            elif isinstance(request.body, six.text_type):
+                body = six.BytesIO(six.b(request.body))
+            else:
+                body = six.BytesIO(request.body)
+            req = Request.from_values(
+                path="?".join([url.path, url.query]),
+                input_stream=body,
+                content_length=request.headers.get("Content-Length"),
+                content_type=request.headers.get("Content-Type"),
+                method=request.method,
+                base_url="{scheme}://{netloc}".format(
+                    scheme=url.scheme, netloc=url.netloc
+                ),
+                headers=[(k, v) for k, v in six.iteritems(request.headers)],
+            )
+            request = req
         headers = self.get_headers()
 
         result = self.callback(request)
@@ -217,10 +241,27 @@ botocore_mock = responses.RequestsMock(
     assert_all_requests_are_fired=False,
     target="botocore.vendored.requests.adapters.HTTPAdapter.send",
 )
+
 responses_mock = responses._default_mock
 # Add passthrough to allow any other requests to work
 # Since this uses .startswith, it applies to http and https requests.
 responses_mock.add_passthru("http")
+
+
+def _find_first_match(self, request):
+    for i, match in enumerate(self._matches):
+        if match.matches(request):
+            return match
+
+    return None
+
+
+# Modify behaviour of the matcher to only/always return the first match
+# Default behaviour is to return subsequent matches for subsequent requests, which leads to https://github.com/spulec/moto/issues/2567
+#  - First request matches on the appropriate S3 URL
+#  - Same request, executed again, will be matched on the subsequent match, which happens to be the catch-all, not-yet-implemented, callback
+# Fix: Always return the first match
+responses_mock._find_match = types.MethodType(_find_first_match, responses_mock)
 
 
 BOTOCORE_HTTP_METHODS = ["GET", "DELETE", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"]
@@ -329,7 +370,7 @@ class BotocoreEventMockAWS(BaseMockAWS):
             responses_mock.add(
                 CallbackResponse(
                     method=method,
-                    url=re.compile("https?://.+.amazonaws.com/.*"),
+                    url=re.compile(r"https?://.+.amazonaws.com/.*"),
                     callback=not_implemented_callback,
                     stream=True,
                     match_querystring=False,
@@ -338,7 +379,7 @@ class BotocoreEventMockAWS(BaseMockAWS):
             botocore_mock.add(
                 CallbackResponse(
                     method=method,
-                    url=re.compile("https?://.+.amazonaws.com/.*"),
+                    url=re.compile(r"https?://.+.amazonaws.com/.*"),
                     callback=not_implemented_callback,
                     stream=True,
                     match_querystring=False,
@@ -606,12 +647,13 @@ class ConfigQueryModel(object):
         As such, the proper way to implement is to first obtain a full list of results from all the region backends, and then filter
         from there. It may be valuable to make this a concatenation of the region and resource name.
 
-        :param resource_region:
-        :param resource_ids:
-        :param resource_name:
-        :param limit:
-        :param next_token:
+        :param resource_ids:  A list of resource IDs
+        :param resource_name: The individual name of a resource
+        :param limit: How many per page
+        :param next_token: The item that will page on
         :param backend_region: The region for the backend to pull results from. Set to `None` if this is an aggregated query.
+        :param resource_region: The region for where the resources reside to pull results from. Set to `None` if this is a
+                                non-aggregated query.
         :return: This should return a list of Dicts that have the following fields:
             [
                 {
@@ -680,12 +722,12 @@ class deprecated_base_decorator(base_decorator):
 
 class MotoAPIBackend(BaseBackend):
     def reset(self):
-        from moto.backends import BACKENDS
+        import moto.backends as backends
 
-        for name, backends in BACKENDS.items():
+        for name, backends_ in backends.named_backends():
             if name == "moto_api":
                 continue
-            for region_name, backend in backends.items():
+            for region_name, backend in backends_.items():
                 backend.reset()
         self.__init__()
 

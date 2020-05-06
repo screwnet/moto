@@ -1,5 +1,6 @@
 from __future__ import unicode_literals
 import functools
+import json
 import logging
 import copy
 import warnings
@@ -17,6 +18,7 @@ from moto.ec2 import models as ec2_models
 from moto.ecs import models as ecs_models
 from moto.elb import models as elb_models
 from moto.elbv2 import models as elbv2_models
+from moto.events import models as events_models
 from moto.iam import models as iam_models
 from moto.kinesis import models as kinesis_models
 from moto.kms import models as kms_models
@@ -24,7 +26,8 @@ from moto.rds import models as rds_models
 from moto.rds2 import models as rds2_models
 from moto.redshift import models as redshift_models
 from moto.route53 import models as route53_models
-from moto.s3 import models as s3_models
+from moto.s3 import models as s3_models, s3_backend
+from moto.s3.utils import bucket_and_name_from_url
 from moto.sns import models as sns_models
 from moto.sqs import models as sqs_models
 from moto.core import ACCOUNT_ID
@@ -92,6 +95,7 @@ MODEL_MAP = {
     "AWS::SNS::Topic": sns_models.Topic,
     "AWS::S3::Bucket": s3_models.FakeBucket,
     "AWS::SQS::Queue": sqs_models.Queue,
+    "AWS::Events::Rule": events_models.Rule,
 }
 
 # http://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-name.html
@@ -150,7 +154,10 @@ def clean_json(resource_json, resources_map):
             map_path = resource_json["Fn::FindInMap"][1:]
             result = resources_map[map_name]
             for path in map_path:
-                result = result[clean_json(path, resources_map)]
+                if "Fn::Transform" in result:
+                    result = resources_map[clean_json(path, resources_map)]
+                else:
+                    result = result[clean_json(path, resources_map)]
             return result
 
         if "Fn::GetAtt" in resource_json:
@@ -196,13 +203,13 @@ def clean_json(resource_json, resources_map):
                 )
             else:
                 fn_sub_value = clean_json(resource_json["Fn::Sub"], resources_map)
-                to_sub = re.findall('(?=\${)[^!^"]*?}', fn_sub_value)
-                literals = re.findall('(?=\${!)[^"]*?}', fn_sub_value)
+                to_sub = re.findall(r'(?=\${)[^!^"]*?}', fn_sub_value)
+                literals = re.findall(r'(?=\${!)[^"]*?}', fn_sub_value)
                 for sub in to_sub:
                     if "." in sub:
                         cleaned_ref = clean_json(
                             {
-                                "Fn::GetAtt": re.findall('(?<=\${)[^"]*?(?=})', sub)[
+                                "Fn::GetAtt": re.findall(r'(?<=\${)[^"]*?(?=})', sub)[
                                     0
                                 ].split(".")
                             },
@@ -210,7 +217,7 @@ def clean_json(resource_json, resources_map):
                         )
                     else:
                         cleaned_ref = clean_json(
-                            {"Ref": re.findall('(?<=\${)[^"]*?(?=})', sub)[0]},
+                            {"Ref": re.findall(r'(?<=\${)[^"]*?(?=})', sub)[0]},
                             resources_map,
                         )
                     fn_sub_value = fn_sub_value.replace(sub, cleaned_ref)
@@ -470,6 +477,17 @@ class ResourceMap(collections_abc.Mapping):
     def load_mapping(self):
         self._parsed_resources.update(self._template.get("Mappings", {}))
 
+    def transform_mapping(self):
+        for k, v in self._template.get("Mappings", {}).items():
+            if "Fn::Transform" in v:
+                name = v["Fn::Transform"]["Name"]
+                params = v["Fn::Transform"]["Parameters"]
+                if name == "AWS::Include":
+                    location = params["Location"]
+                    bucket_name, name = bucket_and_name_from_url(location)
+                    key = s3_backend.get_key(bucket_name, name)
+                    self._parsed_resources.update(json.loads(key.value))
+
     def load_parameters(self):
         parameter_slots = self._template.get("Parameters", {})
         for parameter_name, parameter in parameter_slots.items():
@@ -513,13 +531,16 @@ class ResourceMap(collections_abc.Mapping):
         for condition_name in self.lazy_condition_map:
             self.lazy_condition_map[condition_name]
 
-    def create(self):
+    def load(self):
         self.load_mapping()
+        self.transform_mapping()
         self.load_parameters()
         self.load_conditions()
 
+    def create(self):
         # Since this is a lazy map, to create every object we just need to
         # iterate through self.
+        # Assumes that self.load() has been called before
         self.tags.update(
             {
                 "aws:cloudformation:stack-name": self.get("AWS::StackName"),

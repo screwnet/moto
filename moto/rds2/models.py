@@ -8,7 +8,6 @@ from collections import defaultdict
 from boto3 import Session
 from jinja2 import Template
 from re import compile as re_compile
-from moto.cloudformation.exceptions import UnformattedGetAttTemplateException
 from moto.compat import OrderedDict
 from moto.core import BaseBackend, BaseModel
 from moto.core.utils import get_random_hex
@@ -130,7 +129,9 @@ class Database(BaseModel):
         if not self.option_group_name and self.engine in self.default_option_groups:
             self.option_group_name = self.default_option_groups[self.engine]
         self.character_set_name = kwargs.get("character_set_name", None)
-        self.iam_database_authentication_enabled = False
+        self.enable_iam_database_authentication = kwargs.get(
+            "enable_iam_database_authentication", False
+        )
         self.dbi_resource_id = "db-M5ENSHXFPU6XHZ4G4ZEI5QIO2U"
         self.tags = kwargs.get("tags", [])
 
@@ -214,7 +215,7 @@ class Database(BaseModel):
               <ReadReplicaSourceDBInstanceIdentifier>{{ database.source_db_identifier }}</ReadReplicaSourceDBInstanceIdentifier>
               {% endif %}
               <Engine>{{ database.engine }}</Engine>
-              <IAMDatabaseAuthenticationEnabled>{{database.iam_database_authentication_enabled }}</IAMDatabaseAuthenticationEnabled>
+              <IAMDatabaseAuthenticationEnabled>{{database.enable_iam_database_authentication|lower }}</IAMDatabaseAuthenticationEnabled>
               <LicenseModel>{{ database.license_model }}</LicenseModel>
               <EngineVersion>{{ database.engine_version }}</EngineVersion>
               <OptionGroupMemberships>
@@ -306,6 +307,9 @@ class Database(BaseModel):
                 setattr(self, key, value)
 
     def get_cfn_attribute(self, attribute_name):
+        # Local import to avoid circular dependency with cloudformation.parsing
+        from moto.cloudformation.exceptions import UnformattedGetAttTemplateException
+
         if attribute_name == "Endpoint.Address":
             return self.address
         elif attribute_name == "Endpoint.Port":
@@ -542,7 +546,7 @@ class Snapshot(BaseModel):
               <KmsKeyId>{{ database.kms_key_id }}</KmsKeyId>
               <DBSnapshotArn>{{ snapshot.snapshot_arn }}</DBSnapshotArn>
               <Timezone></Timezone>
-              <IAMDatabaseAuthenticationEnabled>false</IAMDatabaseAuthenticationEnabled>
+              <IAMDatabaseAuthenticationEnabled>{{ database.enable_iam_database_authentication|lower }}</IAMDatabaseAuthenticationEnabled>
             </DBSnapshot>"""
         )
         return template.render(snapshot=self, database=self.database)
@@ -863,7 +867,10 @@ class RDS2Backend(BaseBackend):
     def stop_database(self, db_instance_identifier, db_snapshot_identifier=None):
         database = self.describe_databases(db_instance_identifier)[0]
         # todo: certain rds types not allowed to be stopped at this time.
-        if database.is_replica or database.multi_az:
+        # https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_StopInstance.html#USER_StopInstance.Limitations
+        if database.is_replica or (
+            database.multi_az and database.engine.lower().startswith("sqlserver")
+        ):
             # todo: more db types not supported by stop/start instance api
             raise InvalidDBClusterStateFaultError(db_instance_identifier)
         if database.status != "available":
@@ -986,7 +993,7 @@ class RDS2Backend(BaseBackend):
             )
         if option_group_kwargs["engine_name"] not in valid_option_group_engines.keys():
             raise RDSClientError(
-                "InvalidParameterValue", "Invalid DB engine: non-existant"
+                "InvalidParameterValue", "Invalid DB engine: non-existent"
             )
         if (
             option_group_kwargs["major_engine_version"]

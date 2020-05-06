@@ -53,6 +53,29 @@ def test_get_database_not_exits():
 
 
 @mock_glue
+def test_get_databases_empty():
+    client = boto3.client("glue", region_name="us-east-1")
+    response = client.get_databases()
+    response["DatabaseList"].should.have.length_of(0)
+
+
+@mock_glue
+def test_get_databases_several_items():
+    client = boto3.client("glue", region_name="us-east-1")
+    database_name_1, database_name_2 = "firstdatabase", "seconddatabase"
+
+    helpers.create_database(client, database_name_1)
+    helpers.create_database(client, database_name_2)
+
+    database_list = sorted(
+        client.get_databases()["DatabaseList"], key=lambda x: x["Name"]
+    )
+    database_list.should.have.length_of(2)
+    database_list[0].should.equal({"Name": database_name_1})
+    database_list[1].should.equal({"Name": database_name_2})
+
+
+@mock_glue
 def test_create_table():
     client = boto3.client("glue", region_name="us-east-1")
     database_name = "myspecialdatabase"
@@ -132,7 +155,7 @@ def test_get_table_versions():
     helpers.update_table(client, database_name, table_name, table_input)
     version_inputs["2"] = table_input
 
-    # Updateing with an indentical input should still create a new version
+    # Updateing with an identical input should still create a new version
     helpers.update_table(client, database_name, table_name, table_input)
     version_inputs["3"] = table_input
 

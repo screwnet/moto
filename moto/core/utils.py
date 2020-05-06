@@ -95,7 +95,7 @@ def convert_regex_to_flask_path(url_path):
         match_name, match_pattern = reg.groups()
         return '<regex("{0}"):{1}>'.format(match_pattern, match_name)
 
-    url_path = re.sub("\(\?P<(.*?)>(.*?)\)", caller, url_path)
+    url_path = re.sub(r"\(\?P<(.*?)>(.*?)\)", caller, url_path)
 
     if url_path.endswith("/?"):
         # Flask does own handling of trailing slashes
@@ -187,7 +187,7 @@ def iso_8601_datetime_with_milliseconds(datetime):
 
 
 def iso_8601_datetime_without_milliseconds(datetime):
-    return datetime.strftime("%Y-%m-%dT%H:%M:%S") + "Z"
+    return None if datetime is None else datetime.strftime("%Y-%m-%dT%H:%M:%S") + "Z"
 
 
 RFC1123 = "%a, %d %b %Y %H:%M:%S GMT"
@@ -328,3 +328,25 @@ def py2_strip_unicode_keys(blob):
         blob = new_set
 
     return blob
+
+
+def tags_from_query_string(
+    querystring_dict, prefix="Tag", key_suffix="Key", value_suffix="Value"
+):
+    response_values = {}
+    for key, value in querystring_dict.items():
+        if key.startswith(prefix) and key.endswith(key_suffix):
+            tag_index = key.replace(prefix + ".", "").replace("." + key_suffix, "")
+            tag_key = querystring_dict.get(
+                "{prefix}.{index}.{key_suffix}".format(
+                    prefix=prefix, index=tag_index, key_suffix=key_suffix,
+                )
+            )[0]
+            tag_value_key = "{prefix}.{index}.{value_suffix}".format(
+                prefix=prefix, index=tag_index, value_suffix=value_suffix,
+            )
+            if tag_value_key in querystring_dict:
+                response_values[tag_key] = querystring_dict.get(tag_value_key)[0]
+            else:
+                response_values[tag_key] = None
+    return response_values

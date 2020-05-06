@@ -1,5 +1,6 @@
 from __future__ import unicode_literals
 
+import json
 
 import boto3
 from freezegun import freeze_time
@@ -8,7 +9,7 @@ import sure  # noqa
 from botocore.exceptions import ClientError
 
 import responses
-from moto import mock_apigateway, settings
+from moto import mock_apigateway, mock_cognitoidp, settings
 from moto.core import ACCOUNT_ID
 from nose.tools import assert_raises
 
@@ -26,7 +27,14 @@ def test_create_and_get_rest_api():
     response.pop("ResponseMetadata")
     response.pop("createdDate")
     response.should.equal(
-        {"id": api_id, "name": "my_api", "description": "this is my api"}
+        {
+            "id": api_id,
+            "name": "my_api",
+            "description": "this is my api",
+            "apiKeySource": "HEADER",
+            "endpointConfiguration": {"types": ["EDGE"]},
+            "tags": {},
+        }
     )
 
 
@@ -48,6 +56,130 @@ def test_list_and_delete_apis():
 
 
 @mock_apigateway
+def test_create_rest_api_with_tags():
+    client = boto3.client("apigateway", region_name="us-west-2")
+
+    response = client.create_rest_api(
+        name="my_api", description="this is my api", tags={"MY_TAG1": "MY_VALUE1"}
+    )
+    api_id = response["id"]
+
+    response = client.get_rest_api(restApiId=api_id)
+
+    assert "tags" in response
+    response["tags"].should.equal({"MY_TAG1": "MY_VALUE1"})
+
+
+@mock_apigateway
+def test_create_rest_api_with_policy():
+    client = boto3.client("apigateway", region_name="us-west-2")
+
+    policy = '{"Version": "2012-10-17","Statement": []}'
+    response = client.create_rest_api(
+        name="my_api", description="this is my api", policy=policy
+    )
+    api_id = response["id"]
+
+    response = client.get_rest_api(restApiId=api_id)
+
+    assert "policy" in response
+    response["policy"].should.equal(policy)
+
+
+@mock_apigateway
+def test_create_rest_api_invalid_apikeysource():
+    client = boto3.client("apigateway", region_name="us-west-2")
+
+    with assert_raises(ClientError) as ex:
+        client.create_rest_api(
+            name="my_api",
+            description="this is my api",
+            apiKeySource="not a valid api key source",
+        )
+    ex.exception.response["Error"]["Code"].should.equal("ValidationException")
+
+
+@mock_apigateway
+def test_create_rest_api_valid_apikeysources():
+    client = boto3.client("apigateway", region_name="us-west-2")
+
+    # 1. test creating rest api with HEADER apiKeySource
+    response = client.create_rest_api(
+        name="my_api", description="this is my api", apiKeySource="HEADER",
+    )
+    api_id = response["id"]
+
+    response = client.get_rest_api(restApiId=api_id)
+    response["apiKeySource"].should.equal("HEADER")
+
+    # 2. test creating rest api with AUTHORIZER apiKeySource
+    response = client.create_rest_api(
+        name="my_api2", description="this is my api", apiKeySource="AUTHORIZER",
+    )
+    api_id = response["id"]
+
+    response = client.get_rest_api(restApiId=api_id)
+    response["apiKeySource"].should.equal("AUTHORIZER")
+
+
+@mock_apigateway
+def test_create_rest_api_invalid_endpointconfiguration():
+    client = boto3.client("apigateway", region_name="us-west-2")
+
+    with assert_raises(ClientError) as ex:
+        client.create_rest_api(
+            name="my_api",
+            description="this is my api",
+            endpointConfiguration={"types": ["INVALID"]},
+        )
+    ex.exception.response["Error"]["Code"].should.equal("ValidationException")
+
+
+@mock_apigateway
+def test_create_rest_api_valid_endpointconfigurations():
+    client = boto3.client("apigateway", region_name="us-west-2")
+
+    # 1. test creating rest api with PRIVATE endpointConfiguration
+    response = client.create_rest_api(
+        name="my_api",
+        description="this is my api",
+        endpointConfiguration={"types": ["PRIVATE"]},
+    )
+    api_id = response["id"]
+
+    response = client.get_rest_api(restApiId=api_id)
+    response["endpointConfiguration"].should.equal(
+        {"types": ["PRIVATE"],}
+    )
+
+    # 2. test creating rest api with REGIONAL endpointConfiguration
+    response = client.create_rest_api(
+        name="my_api2",
+        description="this is my api",
+        endpointConfiguration={"types": ["REGIONAL"]},
+    )
+    api_id = response["id"]
+
+    response = client.get_rest_api(restApiId=api_id)
+    response["endpointConfiguration"].should.equal(
+        {"types": ["REGIONAL"],}
+    )
+
+    # 3. test creating rest api with EDGE endpointConfiguration
+    response = client.create_rest_api(
+        name="my_api3",
+        description="this is my api",
+        endpointConfiguration={"types": ["EDGE"]},
+    )
+    api_id = response["id"]
+
+    response = client.get_rest_api(restApiId=api_id)
+    response["endpointConfiguration"].should.equal(
+        {"types": ["EDGE"],}
+    )
+
+
+@mock_apigateway
 def test_create_resource__validate_name():
     client = boto3.client("apigateway", region_name="us-west-2")
     response = client.create_rest_api(name="my_api", description="this is my api")
@@ -58,15 +190,15 @@ def test_create_resource__validate_name():
         0
     ]["id"]
 
-    invalid_names = ["/users", "users/", "users/{user_id}", "us{er"]
-    valid_names = ["users", "{user_id}", "user_09", "good-dog"]
+    invalid_names = ["/users", "users/", "users/{user_id}", "us{er", "us+er"]
+    valid_names = ["users", "{user_id}", "{proxy+}", "user_09", "good-dog"]
     # All invalid names should throw an exception
     for name in invalid_names:
         with assert_raises(ClientError) as ex:
             client.create_resource(restApiId=api_id, parentId=root_id, pathPart=name)
         ex.exception.response["Error"]["Code"].should.equal("BadRequestException")
         ex.exception.response["Error"]["Message"].should.equal(
-            "Resource's path part only allow a-zA-Z0-9._- and curly braces at the beginning and the end."
+            "Resource's path part only allow a-zA-Z0-9._- and curly braces at the beginning and the end and an optional plus sign before the closing brace."
         )
     # All valid names  should go through
     for name in valid_names:
@@ -89,12 +221,7 @@ def test_create_resource():
     root_resource["ResponseMetadata"].pop("HTTPHeaders", None)
     root_resource["ResponseMetadata"].pop("RetryAttempts", None)
     root_resource.should.equal(
-        {
-            "path": "/",
-            "id": root_id,
-            "ResponseMetadata": {"HTTPStatusCode": 200},
-            "resourceMethods": {"GET": {}},
-        }
+        {"path": "/", "id": root_id, "ResponseMetadata": {"HTTPStatusCode": 200},}
     )
 
     client.create_resource(restApiId=api_id, parentId=root_id, pathPart="users")
@@ -142,7 +269,6 @@ def test_child_resource():
             "parentId": users_id,
             "id": tags_id,
             "ResponseMetadata": {"HTTPStatusCode": 200},
-            "resourceMethods": {"GET": {}},
         }
     )
 
@@ -171,6 +297,41 @@ def test_create_method():
         {
             "httpMethod": "GET",
             "authorizationType": "none",
+            "apiKeyRequired": False,
+            "ResponseMetadata": {"HTTPStatusCode": 200},
+        }
+    )
+
+
+@mock_apigateway
+def test_create_method_apikeyrequired():
+    client = boto3.client("apigateway", region_name="us-west-2")
+    response = client.create_rest_api(name="my_api", description="this is my api")
+    api_id = response["id"]
+
+    resources = client.get_resources(restApiId=api_id)
+    root_id = [resource for resource in resources["items"] if resource["path"] == "/"][
+        0
+    ]["id"]
+
+    client.put_method(
+        restApiId=api_id,
+        resourceId=root_id,
+        httpMethod="GET",
+        authorizationType="none",
+        apiKeyRequired=True,
+    )
+
+    response = client.get_method(restApiId=api_id, resourceId=root_id, httpMethod="GET")
+
+    # this is hard to match against, so remove it
+    response["ResponseMetadata"].pop("HTTPHeaders", None)
+    response["ResponseMetadata"].pop("RetryAttempts", None)
+    response.should.equal(
+        {
+            "httpMethod": "GET",
+            "authorizationType": "none",
+            "apiKeyRequired": True,
             "ResponseMetadata": {"HTTPStatusCode": 200},
         }
     )
@@ -430,6 +591,254 @@ def test_integration_response():
 
     response = client.get_method(restApiId=api_id, resourceId=root_id, httpMethod="GET")
     response["methodIntegration"]["integrationResponses"].should.equal({})
+
+
+@mock_apigateway
+@mock_cognitoidp
+def test_update_authorizer_configuration():
+    client = boto3.client("apigateway", region_name="us-west-2")
+    authorizer_name = "my_authorizer"
+    response = client.create_rest_api(name="my_api", description="this is my api")
+    api_id = response["id"]
+
+    cognito_client = boto3.client("cognito-idp", region_name="us-west-2")
+    user_pool_arn = cognito_client.create_user_pool(PoolName="my_cognito_pool")[
+        "UserPool"
+    ]["Arn"]
+
+    response = client.create_authorizer(
+        restApiId=api_id,
+        name=authorizer_name,
+        type="COGNITO_USER_POOLS",
+        providerARNs=[user_pool_arn],
+        identitySource="method.request.header.Authorization",
+    )
+    authorizer_id = response["id"]
+
+    response = client.get_authorizer(restApiId=api_id, authorizerId=authorizer_id)
+    # createdDate is hard to match against, remove it
+    response.pop("createdDate", None)
+    # this is hard to match against, so remove it
+    response["ResponseMetadata"].pop("HTTPHeaders", None)
+    response["ResponseMetadata"].pop("RetryAttempts", None)
+    response.should.equal(
+        {
+            "id": authorizer_id,
+            "name": authorizer_name,
+            "type": "COGNITO_USER_POOLS",
+            "providerARNs": [user_pool_arn],
+            "identitySource": "method.request.header.Authorization",
+            "authorizerResultTtlInSeconds": 300,
+            "ResponseMetadata": {"HTTPStatusCode": 200},
+        }
+    )
+
+    client.update_authorizer(
+        restApiId=api_id,
+        authorizerId=authorizer_id,
+        patchOperations=[{"op": "replace", "path": "/type", "value": "TOKEN"}],
+    )
+
+    authorizer = client.get_authorizer(restApiId=api_id, authorizerId=authorizer_id)
+
+    authorizer.should.have.key("type").which.should.equal("TOKEN")
+
+    client.update_authorizer(
+        restApiId=api_id,
+        authorizerId=authorizer_id,
+        patchOperations=[{"op": "replace", "path": "/type", "value": "REQUEST"}],
+    )
+
+    authorizer = client.get_authorizer(restApiId=api_id, authorizerId=authorizer_id)
+
+    authorizer.should.have.key("type").which.should.equal("REQUEST")
+
+    # TODO: implement mult-update tests
+
+    try:
+        client.update_authorizer(
+            restApiId=api_id,
+            authorizerId=authorizer_id,
+            patchOperations=[
+                {"op": "add", "path": "/notasetting", "value": "eu-west-1"}
+            ],
+        )
+        assert False.should.be.ok  # Fail, should not be here
+    except Exception:
+        assert True.should.be.ok
+
+
+@mock_apigateway
+def test_non_existent_authorizer():
+    client = boto3.client("apigateway", region_name="us-west-2")
+    response = client.create_rest_api(name="my_api", description="this is my api")
+    api_id = response["id"]
+
+    client.get_authorizer.when.called_with(
+        restApiId=api_id, authorizerId="xxx"
+    ).should.throw(ClientError)
+
+
+@mock_apigateway
+@mock_cognitoidp
+def test_create_authorizer():
+    client = boto3.client("apigateway", region_name="us-west-2")
+    authorizer_name = "my_authorizer"
+    response = client.create_rest_api(name="my_api", description="this is my api")
+    api_id = response["id"]
+
+    cognito_client = boto3.client("cognito-idp", region_name="us-west-2")
+    user_pool_arn = cognito_client.create_user_pool(PoolName="my_cognito_pool")[
+        "UserPool"
+    ]["Arn"]
+
+    response = client.create_authorizer(
+        restApiId=api_id,
+        name=authorizer_name,
+        type="COGNITO_USER_POOLS",
+        providerARNs=[user_pool_arn],
+        identitySource="method.request.header.Authorization",
+    )
+    authorizer_id = response["id"]
+
+    response = client.get_authorizer(restApiId=api_id, authorizerId=authorizer_id)
+    # createdDate is hard to match against, remove it
+    response.pop("createdDate", None)
+    # this is hard to match against, so remove it
+    response["ResponseMetadata"].pop("HTTPHeaders", None)
+    response["ResponseMetadata"].pop("RetryAttempts", None)
+    response.should.equal(
+        {
+            "id": authorizer_id,
+            "name": authorizer_name,
+            "type": "COGNITO_USER_POOLS",
+            "providerARNs": [user_pool_arn],
+            "identitySource": "method.request.header.Authorization",
+            "authorizerResultTtlInSeconds": 300,
+            "ResponseMetadata": {"HTTPStatusCode": 200},
+        }
+    )
+
+    authorizer_name2 = "my_authorizer2"
+    response = client.create_authorizer(
+        restApiId=api_id,
+        name=authorizer_name2,
+        type="COGNITO_USER_POOLS",
+        providerARNs=[user_pool_arn],
+        identitySource="method.request.header.Authorization",
+    )
+    authorizer_id2 = response["id"]
+
+    response = client.get_authorizers(restApiId=api_id)
+
+    # this is hard to match against, so remove it
+    response["ResponseMetadata"].pop("HTTPHeaders", None)
+    response["ResponseMetadata"].pop("RetryAttempts", None)
+
+    response["items"][0]["id"].should.match(
+        r"{0}|{1}".format(authorizer_id2, authorizer_id)
+    )
+    response["items"][1]["id"].should.match(
+        r"{0}|{1}".format(authorizer_id2, authorizer_id)
+    )
+
+    new_authorizer_name_with_vars = "authorizer_with_vars"
+    response = client.create_authorizer(
+        restApiId=api_id,
+        name=new_authorizer_name_with_vars,
+        type="COGNITO_USER_POOLS",
+        providerARNs=[user_pool_arn],
+        identitySource="method.request.header.Authorization",
+    )
+    authorizer_id3 = response["id"]
+
+    # this is hard to match against, so remove it
+    response["ResponseMetadata"].pop("HTTPHeaders", None)
+    response["ResponseMetadata"].pop("RetryAttempts", None)
+
+    response.should.equal(
+        {
+            "name": new_authorizer_name_with_vars,
+            "id": authorizer_id3,
+            "type": "COGNITO_USER_POOLS",
+            "providerARNs": [user_pool_arn],
+            "identitySource": "method.request.header.Authorization",
+            "authorizerResultTtlInSeconds": 300,
+            "ResponseMetadata": {"HTTPStatusCode": 200},
+        }
+    )
+
+    stage = client.get_authorizer(restApiId=api_id, authorizerId=authorizer_id3)
+    stage["name"].should.equal(new_authorizer_name_with_vars)
+    stage["id"].should.equal(authorizer_id3)
+    stage["type"].should.equal("COGNITO_USER_POOLS")
+    stage["providerARNs"].should.equal([user_pool_arn])
+    stage["identitySource"].should.equal("method.request.header.Authorization")
+    stage["authorizerResultTtlInSeconds"].should.equal(300)
+
+
+@mock_apigateway
+@mock_cognitoidp
+def test_delete_authorizer():
+    client = boto3.client("apigateway", region_name="us-west-2")
+    authorizer_name = "my_authorizer"
+    response = client.create_rest_api(name="my_api", description="this is my api")
+    api_id = response["id"]
+
+    cognito_client = boto3.client("cognito-idp", region_name="us-west-2")
+    user_pool_arn = cognito_client.create_user_pool(PoolName="my_cognito_pool")[
+        "UserPool"
+    ]["Arn"]
+
+    response = client.create_authorizer(
+        restApiId=api_id,
+        name=authorizer_name,
+        type="COGNITO_USER_POOLS",
+        providerARNs=[user_pool_arn],
+        identitySource="method.request.header.Authorization",
+    )
+    authorizer_id = response["id"]
+
+    response = client.get_authorizer(restApiId=api_id, authorizerId=authorizer_id)
+    # createdDate is hard to match against, remove it
+    response.pop("createdDate", None)
+    # this is hard to match against, so remove it
+    response["ResponseMetadata"].pop("HTTPHeaders", None)
+    response["ResponseMetadata"].pop("RetryAttempts", None)
+    response.should.equal(
+        {
+            "id": authorizer_id,
+            "name": authorizer_name,
+            "type": "COGNITO_USER_POOLS",
+            "providerARNs": [user_pool_arn],
+            "identitySource": "method.request.header.Authorization",
+            "authorizerResultTtlInSeconds": 300,
+            "ResponseMetadata": {"HTTPStatusCode": 200},
+        }
+    )
+
+    authorizer_name2 = "my_authorizer2"
+    response = client.create_authorizer(
+        restApiId=api_id,
+        name=authorizer_name2,
+        type="COGNITO_USER_POOLS",
+        providerARNs=[user_pool_arn],
+        identitySource="method.request.header.Authorization",
+    )
+    authorizer_id2 = response["id"]
+
+    authorizers = client.get_authorizers(restApiId=api_id)["items"]
+    sorted([authorizer["name"] for authorizer in authorizers]).should.equal(
+        sorted([authorizer_name2, authorizer_name])
+    )
+    # delete stage
+    response = client.delete_authorizer(restApiId=api_id, authorizerId=authorizer_id2)
+    response["ResponseMetadata"]["HTTPStatusCode"].should.equal(202)
+    # verify other stage still exists
+    authorizers = client.get_authorizers(restApiId=api_id)["items"]
+    sorted([authorizer["name"] for authorizer in authorizers]).should.equal(
+        sorted([authorizer_name])
+    )
 
 
 @mock_apigateway
@@ -823,6 +1232,65 @@ def test_put_integration_response_requires_responseTemplate():
 
 
 @mock_apigateway
+def test_put_integration_response_with_response_template():
+    client = boto3.client("apigateway", region_name="us-west-2")
+    response = client.create_rest_api(name="my_api", description="this is my api")
+    api_id = response["id"]
+    resources = client.get_resources(restApiId=api_id)
+    root_id = [resource for resource in resources["items"] if resource["path"] == "/"][
+        0
+    ]["id"]
+
+    client.put_method(
+        restApiId=api_id, resourceId=root_id, httpMethod="GET", authorizationType="NONE"
+    )
+    client.put_method_response(
+        restApiId=api_id, resourceId=root_id, httpMethod="GET", statusCode="200"
+    )
+    client.put_integration(
+        restApiId=api_id,
+        resourceId=root_id,
+        httpMethod="GET",
+        type="HTTP",
+        uri="http://httpbin.org/robots.txt",
+        integrationHttpMethod="POST",
+    )
+
+    with assert_raises(ClientError) as ex:
+        client.put_integration_response(
+            restApiId=api_id, resourceId=root_id, httpMethod="GET", statusCode="200"
+        )
+
+    ex.exception.response["Error"]["Code"].should.equal("BadRequestException")
+    ex.exception.response["Error"]["Message"].should.equal("Invalid request input")
+
+    client.put_integration_response(
+        restApiId=api_id,
+        resourceId=root_id,
+        httpMethod="GET",
+        statusCode="200",
+        selectionPattern="foobar",
+        responseTemplates={"application/json": json.dumps({"data": "test"})},
+    )
+
+    response = client.get_integration_response(
+        restApiId=api_id, resourceId=root_id, httpMethod="GET", statusCode="200"
+    )
+
+    # this is hard to match against, so remove it
+    response["ResponseMetadata"].pop("HTTPHeaders", None)
+    response["ResponseMetadata"].pop("RetryAttempts", None)
+    response.should.equal(
+        {
+            "statusCode": "200",
+            "selectionPattern": "foobar",
+            "ResponseMetadata": {"HTTPStatusCode": 200},
+            "responseTemplates": {"application/json": json.dumps({"data": "test"})},
+        }
+    )
+
+
+@mock_apigateway
 def test_put_integration_validation():
     client = boto3.client("apigateway", region_name="us-west-2")
     response = client.create_rest_api(name="my_api", description="this is my api")
@@ -1092,6 +1560,181 @@ def test_deployment():
 
 
 @mock_apigateway
+def test_create_domain_names():
+    client = boto3.client("apigateway", region_name="us-west-2")
+    domain_name = "testDomain"
+    test_certificate_name = "test.certificate"
+    test_certificate_private_key = "testPrivateKey"
+    # success case with valid params
+    response = client.create_domain_name(
+        domainName=domain_name,
+        certificateName=test_certificate_name,
+        certificatePrivateKey=test_certificate_private_key,
+    )
+    response["domainName"].should.equal(domain_name)
+    response["certificateName"].should.equal(test_certificate_name)
+    # without domain name it should throw BadRequestException
+    with assert_raises(ClientError) as ex:
+        client.create_domain_name(domainName="")
+
+    ex.exception.response["Error"]["Message"].should.equal("No Domain Name specified")
+    ex.exception.response["Error"]["Code"].should.equal("BadRequestException")
+
+
+@mock_apigateway
+def test_get_domain_names():
+    client = boto3.client("apigateway", region_name="us-west-2")
+    # without any domain names already present
+    result = client.get_domain_names()
+    result["items"].should.equal([])
+    domain_name = "testDomain"
+    test_certificate_name = "test.certificate"
+    response = client.create_domain_name(
+        domainName=domain_name, certificateName=test_certificate_name
+    )
+
+    response["domainName"].should.equal(domain_name)
+    response["certificateName"].should.equal(test_certificate_name)
+    response["domainNameStatus"].should.equal("AVAILABLE")
+    # after adding a new domain name
+    result = client.get_domain_names()
+    result["items"][0]["domainName"].should.equal(domain_name)
+    result["items"][0]["certificateName"].should.equal(test_certificate_name)
+    result["items"][0]["domainNameStatus"].should.equal("AVAILABLE")
+
+
+@mock_apigateway
+def test_get_domain_name():
+    client = boto3.client("apigateway", region_name="us-west-2")
+    domain_name = "testDomain"
+    # quering an invalid domain name which is not present
+    with assert_raises(ClientError) as ex:
+        client.get_domain_name(domainName=domain_name)
+
+    ex.exception.response["Error"]["Message"].should.equal(
+        "Invalid Domain Name specified"
+    )
+    ex.exception.response["Error"]["Code"].should.equal("NotFoundException")
+    # adding a domain name
+    client.create_domain_name(domainName=domain_name)
+    # retrieving the data of added domain name.
+    result = client.get_domain_name(domainName=domain_name)
+    result["domainName"].should.equal(domain_name)
+    result["domainNameStatus"].should.equal("AVAILABLE")
+
+
+@mock_apigateway
+def test_create_model():
+    client = boto3.client("apigateway", region_name="us-west-2")
+    response = client.create_rest_api(name="my_api", description="this is my api")
+    rest_api_id = response["id"]
+    dummy_rest_api_id = "a12b3c4d"
+    model_name = "testModel"
+    description = "test model"
+    content_type = "application/json"
+    # success case with valid params
+    response = client.create_model(
+        restApiId=rest_api_id,
+        name=model_name,
+        description=description,
+        contentType=content_type,
+    )
+    response["name"].should.equal(model_name)
+    response["description"].should.equal(description)
+
+    # with an invalid rest_api_id it should throw NotFoundException
+    with assert_raises(ClientError) as ex:
+        client.create_model(
+            restApiId=dummy_rest_api_id,
+            name=model_name,
+            description=description,
+            contentType=content_type,
+        )
+    ex.exception.response["Error"]["Message"].should.equal(
+        "Invalid Rest API Id specified"
+    )
+    ex.exception.response["Error"]["Code"].should.equal("NotFoundException")
+
+    with assert_raises(ClientError) as ex:
+        client.create_model(
+            restApiId=rest_api_id,
+            name="",
+            description=description,
+            contentType=content_type,
+        )
+
+    ex.exception.response["Error"]["Message"].should.equal("No Model Name specified")
+    ex.exception.response["Error"]["Code"].should.equal("BadRequestException")
+
+
+@mock_apigateway
+def test_get_api_models():
+    client = boto3.client("apigateway", region_name="us-west-2")
+    response = client.create_rest_api(name="my_api", description="this is my api")
+    rest_api_id = response["id"]
+    model_name = "testModel"
+    description = "test model"
+    content_type = "application/json"
+    # when no models are present
+    result = client.get_models(restApiId=rest_api_id)
+    result["items"].should.equal([])
+    # add a model
+    client.create_model(
+        restApiId=rest_api_id,
+        name=model_name,
+        description=description,
+        contentType=content_type,
+    )
+    # get models after adding
+    result = client.get_models(restApiId=rest_api_id)
+    result["items"][0]["name"] = model_name
+    result["items"][0]["description"] = description
+
+
+@mock_apigateway
+def test_get_model_by_name():
+    client = boto3.client("apigateway", region_name="us-west-2")
+    response = client.create_rest_api(name="my_api", description="this is my api")
+    rest_api_id = response["id"]
+    dummy_rest_api_id = "a12b3c4d"
+    model_name = "testModel"
+    description = "test model"
+    content_type = "application/json"
+    # add a model
+    client.create_model(
+        restApiId=rest_api_id,
+        name=model_name,
+        description=description,
+        contentType=content_type,
+    )
+    # get models after adding
+    result = client.get_model(restApiId=rest_api_id, modelName=model_name)
+    result["name"] = model_name
+    result["description"] = description
+
+    with assert_raises(ClientError) as ex:
+        client.get_model(restApiId=dummy_rest_api_id, modelName=model_name)
+    ex.exception.response["Error"]["Message"].should.equal(
+        "Invalid Rest API Id specified"
+    )
+    ex.exception.response["Error"]["Code"].should.equal("NotFoundException")
+
+
+@mock_apigateway
+def test_get_model_with_invalid_name():
+    client = boto3.client("apigateway", region_name="us-west-2")
+    response = client.create_rest_api(name="my_api", description="this is my api")
+    rest_api_id = response["id"]
+    # test with an invalid model name
+    with assert_raises(ClientError) as ex:
+        client.get_model(restApiId=rest_api_id, modelName="fake")
+    ex.exception.response["Error"]["Message"].should.equal(
+        "Invalid Model Name specified"
+    )
+    ex.exception.response["Error"]["Code"].should.equal("NotFoundException")
+
+
+@mock_apigateway
 def test_http_proxying_integration():
     responses.add(
         responses.GET, "http://httpbin.org/robots.txt", body="a fake response"
@@ -1214,6 +1857,14 @@ def test_usage_plans():
     response = client.get_usage_plans()
     len(response["items"]).should.equal(0)
 
+    # # Try to get info about a non existing usage
+    with assert_raises(ClientError) as ex:
+        client.get_usage_plan(usagePlanId="not_existing")
+    ex.exception.response["Error"]["Code"].should.equal("NotFoundException")
+    ex.exception.response["Error"]["Message"].should.equal(
+        "Invalid Usage Plan ID specified"
+    )
+
     usage_plan_name = "TEST-PLAN"
     payload = {"name": usage_plan_name}
     response = client.create_usage_plan(**payload)
@@ -1295,6 +1946,30 @@ def test_usage_plan_keys():
     # Get current plan keys (expect none)
     response = client.get_usage_plan_keys(usagePlanId=usage_plan_id)
     len(response["items"]).should.equal(0)
+
+    # Try to get info about a non existing api key
+    with assert_raises(ClientError) as ex:
+        client.get_usage_plan_key(usagePlanId=usage_plan_id, keyId="not_existing_key")
+    ex.exception.response["Error"]["Code"].should.equal("NotFoundException")
+    ex.exception.response["Error"]["Message"].should.equal(
+        "Invalid API Key identifier specified"
+    )
+
+    # Try to get info about an existing api key that has not jet added to a valid usage plan
+    with assert_raises(ClientError) as ex:
+        client.get_usage_plan_key(usagePlanId=usage_plan_id, keyId=key_id)
+    ex.exception.response["Error"]["Code"].should.equal("NotFoundException")
+    ex.exception.response["Error"]["Message"].should.equal(
+        "Invalid Usage Plan ID specified"
+    )
+
+    # Try to get info about an existing api key that has not jet added to a valid usage plan
+    with assert_raises(ClientError) as ex:
+        client.get_usage_plan_key(usagePlanId="not_existing_plan_id", keyId=key_id)
+    ex.exception.response["Error"]["Code"].should.equal("NotFoundException")
+    ex.exception.response["Error"]["Message"].should.equal(
+        "Invalid Usage Plan ID specified"
+    )
 
 
 @mock_apigateway

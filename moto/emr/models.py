@@ -35,6 +35,7 @@ class FakeInstanceGroup(BaseModel):
         name=None,
         id=None,
         bid_price=None,
+        ebs_configuration=None,
     ):
         self.id = id or random_instance_group_id()
 
@@ -51,6 +52,7 @@ class FakeInstanceGroup(BaseModel):
         self.num_instances = instance_count
         self.role = instance_role
         self.type = instance_type
+        self.ebs_configuration = ebs_configuration
 
         self.creation_datetime = datetime.now(pytz.utc)
         self.start_datetime = datetime.now(pytz.utc)
@@ -85,6 +87,9 @@ class FakeStep(BaseModel):
         self.ready_datetime = None
         self.start_datetime = None
         self.state = state
+
+    def start(self):
+        self.start_datetime = datetime.now(pytz.utc)
 
 
 class FakeCluster(BaseModel):
@@ -204,6 +209,8 @@ class FakeCluster(BaseModel):
 
         self.start_cluster()
         self.run_bootstrap_actions()
+        if self.steps:
+            self.steps[0].start()
 
     @property
     def instance_groups(self):

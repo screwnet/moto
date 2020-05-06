@@ -118,8 +118,10 @@ class TaskDefinition(BaseObject):
         revision,
         container_definitions,
         region_name,
+        network_mode=None,
         volumes=None,
         tags=None,
+        placement_constraints=None,
     ):
         self.family = family
         self.revision = revision
@@ -132,6 +134,13 @@ class TaskDefinition(BaseObject):
             self.volumes = []
         else:
             self.volumes = volumes
+        if network_mode is None:
+            self.network_mode = "bridge"
+        else:
+            self.network_mode = network_mode
+        self.placement_constraints = (
+            placement_constraints if placement_constraints is not None else []
+        )
 
     @property
     def response_object(self):
@@ -553,7 +562,13 @@ class EC2ContainerServiceBackend(BaseBackend):
             raise Exception("{0} is not a cluster".format(cluster_name))
 
     def register_task_definition(
-        self, family, container_definitions, volumes, tags=None
+        self,
+        family,
+        container_definitions,
+        volumes=None,
+        network_mode=None,
+        tags=None,
+        placement_constraints=None,
     ):
         if family in self.task_definitions:
             last_id = self._get_last_task_definition_revision_id(family)
@@ -562,7 +577,14 @@ class EC2ContainerServiceBackend(BaseBackend):
             self.task_definitions[family] = {}
             revision = 1
         task_definition = TaskDefinition(
-            family, revision, container_definitions, self.region_name, volumes, tags
+            family,
+            revision,
+            container_definitions,
+            self.region_name,
+            volumes=volumes,
+            network_mode=network_mode,
+            tags=tags,
+            placement_constraints=placement_constraints,
         )
         self.task_definitions[family][revision] = task_definition
 
@@ -593,7 +615,10 @@ class EC2ContainerServiceBackend(BaseBackend):
             raise Exception("{0} is not a task_definition".format(task_definition_name))
 
     def run_task(self, cluster_str, task_definition_str, count, overrides, started_by):
-        cluster_name = cluster_str.split("/")[-1]
+        if cluster_str:
+            cluster_name = cluster_str.split("/")[-1]
+        else:
+            cluster_name = "default"
         if cluster_name in self.clusters:
             cluster = self.clusters[cluster_name]
         else:

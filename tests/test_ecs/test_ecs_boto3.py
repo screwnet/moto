@@ -94,6 +94,7 @@ def test_register_task_definition():
                 "logConfiguration": {"logDriver": "json-file"},
             }
         ],
+        networkMode="bridge",
         tags=[
             {"key": "createdBy", "value": "moto-unittest"},
             {"key": "foo", "value": "bar"},
@@ -124,6 +125,7 @@ def test_register_task_definition():
     response["taskDefinition"]["containerDefinitions"][0]["logConfiguration"][
         "logDriver"
     ].should.equal("json-file")
+    response["taskDefinition"]["networkMode"].should.equal("bridge")
 
 
 @mock_ecs
@@ -724,7 +726,7 @@ def test_delete_service():
 
 
 @mock_ecs
-def test_update_non_existant_service():
+def test_update_non_existent_service():
     client = boto3.client("ecs", region_name="us-east-1")
     try:
         client.update_service(
@@ -1106,6 +1108,71 @@ def test_run_task():
     )
     response["tasks"][0]["clusterArn"].should.equal(
         "arn:aws:ecs:us-east-1:012345678910:cluster/test_ecs_cluster"
+    )
+    response["tasks"][0]["taskDefinitionArn"].should.equal(
+        "arn:aws:ecs:us-east-1:012345678910:task-definition/test_ecs_task:1"
+    )
+    response["tasks"][0]["containerInstanceArn"].should.contain(
+        "arn:aws:ecs:us-east-1:012345678910:container-instance/"
+    )
+    response["tasks"][0]["overrides"].should.equal({})
+    response["tasks"][0]["lastStatus"].should.equal("RUNNING")
+    response["tasks"][0]["desiredStatus"].should.equal("RUNNING")
+    response["tasks"][0]["startedBy"].should.equal("moto")
+    response["tasks"][0]["stoppedReason"].should.equal("")
+
+
+@mock_ec2
+@mock_ecs
+def test_run_task_default_cluster():
+    client = boto3.client("ecs", region_name="us-east-1")
+    ec2 = boto3.resource("ec2", region_name="us-east-1")
+
+    test_cluster_name = "default"
+
+    _ = client.create_cluster(clusterName=test_cluster_name)
+
+    test_instance = ec2.create_instances(
+        ImageId="ami-1234abcd", MinCount=1, MaxCount=1
+    )[0]
+
+    instance_id_document = json.dumps(
+        ec2_utils.generate_instance_identity_document(test_instance)
+    )
+
+    response = client.register_container_instance(
+        cluster=test_cluster_name, instanceIdentityDocument=instance_id_document
+    )
+
+    _ = client.register_task_definition(
+        family="test_ecs_task",
+        containerDefinitions=[
+            {
+                "name": "hello_world",
+                "image": "docker/hello-world:latest",
+                "cpu": 1024,
+                "memory": 400,
+                "essential": True,
+                "environment": [
+                    {"name": "AWS_ACCESS_KEY_ID", "value": "SOME_ACCESS_KEY"}
+                ],
+                "logConfiguration": {"logDriver": "json-file"},
+            }
+        ],
+    )
+    response = client.run_task(
+        launchType="FARGATE",
+        overrides={},
+        taskDefinition="test_ecs_task",
+        count=2,
+        startedBy="moto",
+    )
+    len(response["tasks"]).should.equal(2)
+    response["tasks"][0]["taskArn"].should.contain(
+        "arn:aws:ecs:us-east-1:012345678910:task/"
+    )
+    response["tasks"][0]["clusterArn"].should.equal(
+        "arn:aws:ecs:us-east-1:012345678910:cluster/default"
     )
     response["tasks"][0]["taskDefinitionArn"].should.equal(
         "arn:aws:ecs:us-east-1:012345678910:task-definition/test_ecs_task:1"
@@ -2537,3 +2604,36 @@ def test_ecs_service_untag_resource_multiple_tags():
         resourceArn=response["service"]["serviceArn"]
     )
     response["tags"].should.equal([{"key": "hello", "value": "world"}])
+
+
+@mock_ecs
+def test_ecs_task_definition_placement_constraints():
+    client = boto3.client("ecs", region_name="us-east-1")
+    response = client.register_task_definition(
+        family="test_ecs_task",
+        containerDefinitions=[
+            {
+                "name": "hello_world",
+                "image": "docker/hello-world:latest",
+                "cpu": 1024,
+                "memory": 400,
+                "essential": True,
+                "environment": [
+                    {"name": "AWS_ACCESS_KEY_ID", "value": "SOME_ACCESS_KEY"}
+                ],
+                "logConfiguration": {"logDriver": "json-file"},
+            }
+        ],
+        networkMode="bridge",
+        tags=[
+            {"key": "createdBy", "value": "moto-unittest"},
+            {"key": "foo", "value": "bar"},
+        ],
+        placementConstraints=[
+            {"type": "memberOf", "expression": "attribute:ecs.instance-type =~ t2.*"}
+        ],
+    )
+    type(response["taskDefinition"]["placementConstraints"]).should.be(list)
+    response["taskDefinition"]["placementConstraints"].should.equal(
+        [{"type": "memberOf", "expression": "attribute:ecs.instance-type =~ t2.*"}]
+    )

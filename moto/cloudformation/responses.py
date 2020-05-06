@@ -229,6 +229,9 @@ class CloudFormationResponse(BaseResponse):
         stack_name_or_id = self._get_param("StackName")
         resources = self.cloudformation_backend.list_stack_resources(stack_name_or_id)
 
+        if resources is None:
+            raise ValidationError(stack_name_or_id)
+
         template = self.response_template(LIST_STACKS_RESOURCES_RESPONSE)
         return template.render(resources=resources)
 
@@ -659,7 +662,7 @@ DESCRIBE_STACKS_TEMPLATE = """<DescribeStacksResponse>
       <member>
         <StackName>{{ stack.name }}</StackName>
         <StackId>{{ stack.stack_id }}</StackId>
-        <CreationTime>2010-07-27T22:28:28Z</CreationTime>
+        <CreationTime>{{ stack.creation_time_iso_8601 }}</CreationTime>
         <StackStatus>{{ stack.status }}</StackStatus>
         {% if stack.notification_arns %}
         <NotificationARNs>
@@ -800,7 +803,7 @@ LIST_STACKS_RESPONSE = """<ListStacksResponse>
         <StackId>{{ stack.stack_id }}</StackId>
         <StackStatus>{{ stack.status }}</StackStatus>
         <StackName>{{ stack.name }}</StackName>
-        <CreationTime>2011-05-23T15:47:44Z</CreationTime>
+        <CreationTime>{{ stack.creation_time_iso_8601 }}</CreationTime>
         <TemplateDescription>{{ stack.description }}</TemplateDescription>
     </member>
     {% endfor %}

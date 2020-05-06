@@ -52,7 +52,7 @@ class InstanceResponse(BaseResponse):
         private_ip = self._get_param("PrivateIpAddress")
         associate_public_ip = self._get_param("AssociatePublicIpAddress")
         key_name = self._get_param("KeyName")
-        ebs_optimized = self._get_param("EbsOptimized")
+        ebs_optimized = self._get_param("EbsOptimized") or False
         instance_initiated_shutdown_behavior = self._get_param(
             "InstanceInitiatedShutdownBehavior"
         )
@@ -113,16 +113,34 @@ class InstanceResponse(BaseResponse):
             template = self.response_template(EC2_START_INSTANCES)
             return template.render(instances=instances)
 
+    def _get_list_of_dict_params(self, param_prefix, _dct):
+        """
+        Simplified version of _get_dict_param
+        Allows you to pass in a custom dict instead of using self.querystring by default
+        """
+        params = []
+        for key, value in _dct.items():
+            if key.startswith(param_prefix):
+                params.append(value)
+        return params
+
     def describe_instance_status(self):
         instance_ids = self._get_multi_param("InstanceId")
         include_all_instances = self._get_param("IncludeAllInstances") == "true"
+        filters = self._get_list_prefix("Filter")
+        filters = [
+            {"name": f["name"], "values": self._get_list_of_dict_params("value.", f)}
+            for f in filters
+        ]
 
         if instance_ids:
-            instances = self.ec2_backend.get_multi_instances_by_id(instance_ids)
+            instances = self.ec2_backend.get_multi_instances_by_id(
+                instance_ids, filters
+            )
         elif include_all_instances:
-            instances = self.ec2_backend.all_instances()
+            instances = self.ec2_backend.all_instances(filters)
         else:
-            instances = self.ec2_backend.all_running_instances()
+            instances = self.ec2_backend.all_running_instances(filters)
 
         template = self.response_template(EC2_INSTANCE_STATUS)
         return template.render(instances=instances)
@@ -149,6 +167,14 @@ class InstanceResponse(BaseResponse):
             template = self.response_template(EC2_DESCRIBE_INSTANCE_ATTRIBUTE)
 
         return template.render(instance=instance, attribute=attribute, value=value)
+
+    def describe_instance_credit_specifications(self):
+        instance_ids = self._get_multi_param("InstanceId")
+        instance = self.ec2_backend.describe_instance_credit_specifications(
+            instance_ids
+        )
+        template = self.response_template(EC2_DESCRIBE_INSTANCE_CREDIT_SPECIFICATIONS)
+        return template.render(instances=instance)
 
     def modify_instance_attribute(self):
         handlers = [
@@ -652,6 +678,18 @@ EC2_DESCRIBE_INSTANCE_ATTRIBUTE = """<DescribeInstanceAttributeResponse xmlns="h
     {% endif %}
   </{{ attribute }}>
 </DescribeInstanceAttributeResponse>"""
+
+EC2_DESCRIBE_INSTANCE_CREDIT_SPECIFICATIONS = """<DescribeInstanceCreditSpecificationsResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">
+    <requestId>1b234b5c-d6ef-7gh8-90i1-j2345678901</requestId>
+    <instanceCreditSpecificationSet>
+       {% for instance in instances %}
+      <item>
+        <instanceId>{{ instance.id }}</instanceId>
+        <cpuCredits>standard</cpuCredits>
+      </item>
+    {% endfor %}
+    </instanceCreditSpecificationSet>
+</DescribeInstanceCreditSpecificationsResponse>"""
 
 EC2_DESCRIBE_INSTANCE_GROUPSET_ATTRIBUTE = """<DescribeInstanceAttributeResponse xmlns="http://ec2.amazonaws.com/doc/2013-10-15/">
   <requestId>59dbff89-35bd-4eac-99ed-be587EXAMPLE</requestId>

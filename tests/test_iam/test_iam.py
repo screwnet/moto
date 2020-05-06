@@ -4,6 +4,7 @@ import json
 
 import boto
 import boto3
+import csv
 import os
 import sure  # noqa
 import sys
@@ -11,9 +12,10 @@ from boto.exception import BotoServerError
 from botocore.exceptions import ClientError
 from dateutil.tz import tzutc
 
-from moto import mock_iam, mock_iam_deprecated
-from moto.iam.models import aws_managed_policies
+from moto import mock_iam, mock_iam_deprecated, settings
 from moto.core import ACCOUNT_ID
+from moto.iam.models import aws_managed_policies
+from moto.backends import get_backend
 from nose.tools import assert_raises, assert_equals
 from nose.tools import raises
 
@@ -785,13 +787,26 @@ def test_delete_login_profile():
     conn.delete_login_profile("my-user")
 
 
-@mock_iam()
+@mock_iam
 def test_create_access_key():
     conn = boto3.client("iam", region_name="us-east-1")
     with assert_raises(ClientError):
         conn.create_access_key(UserName="my-user")
     conn.create_user(UserName="my-user")
     access_key = conn.create_access_key(UserName="my-user")["AccessKey"]
+    (
+        datetime.utcnow() - access_key["CreateDate"].replace(tzinfo=None)
+    ).seconds.should.be.within(0, 10)
+    access_key["AccessKeyId"].should.have.length_of(20)
+    access_key["SecretAccessKey"].should.have.length_of(40)
+    assert access_key["AccessKeyId"].startswith("AKIA")
+    conn = boto3.client(
+        "iam",
+        region_name="us-east-1",
+        aws_access_key_id=access_key["AccessKeyId"],
+        aws_secret_access_key=access_key["SecretAccessKey"],
+    )
+    access_key = conn.create_access_key()["AccessKey"]
     (
         datetime.utcnow() - access_key["CreateDate"].replace(tzinfo=None)
     ).seconds.should.be.within(0, 10)
@@ -825,14 +840,51 @@ def test_get_all_access_keys():
     )
 
 
+@mock_iam
+def test_list_access_keys():
+    conn = boto3.client("iam", region_name="us-east-1")
+    conn.create_user(UserName="my-user")
+    response = conn.list_access_keys(UserName="my-user")
+    assert_equals(
+        response["AccessKeyMetadata"], [],
+    )
+    access_key = conn.create_access_key(UserName="my-user")["AccessKey"]
+    response = conn.list_access_keys(UserName="my-user")
+    assert_equals(
+        sorted(response["AccessKeyMetadata"][0].keys()),
+        sorted(["Status", "CreateDate", "UserName", "AccessKeyId"]),
+    )
+    conn = boto3.client(
+        "iam",
+        region_name="us-east-1",
+        aws_access_key_id=access_key["AccessKeyId"],
+        aws_secret_access_key=access_key["SecretAccessKey"],
+    )
+    response = conn.list_access_keys()
+    assert_equals(
+        sorted(response["AccessKeyMetadata"][0].keys()),
+        sorted(["Status", "CreateDate", "UserName", "AccessKeyId"]),
+    )
+
+
 @mock_iam_deprecated()
-def test_delete_access_key():
+def test_delete_access_key_deprecated():
     conn = boto.connect_iam()
     conn.create_user("my-user")
     access_key_id = conn.create_access_key("my-user")["create_access_key_response"][
         "create_access_key_result"
     ]["access_key"]["access_key_id"]
     conn.delete_access_key(access_key_id, "my-user")
+
+
+@mock_iam
+def test_delete_access_key():
+    conn = boto3.client("iam", region_name="us-east-1")
+    conn.create_user(UserName="my-user")
+    key = conn.create_access_key(UserName="my-user")["AccessKey"]
+    conn.delete_access_key(AccessKeyId=key["AccessKeyId"], UserName="my-user")
+    key = conn.create_access_key(UserName="my-user")["AccessKey"]
+    conn.delete_access_key(AccessKeyId=key["AccessKeyId"])
 
 
 @mock_iam()
@@ -1165,6 +1217,69 @@ def test_boto3_get_credential_report():
     report.should.match(r".*my-user.*")
 
 
+@mock_iam
+def test_boto3_get_credential_report_content():
+    conn = boto3.client("iam", region_name="us-east-1")
+    username = "my-user"
+    conn.create_user(UserName=username)
+    key1 = conn.create_access_key(UserName=username)["AccessKey"]
+    conn.update_access_key(
+        UserName=username, AccessKeyId=key1["AccessKeyId"], Status="Inactive"
+    )
+    key1 = conn.create_access_key(UserName=username)["AccessKey"]
+    timestamp = datetime.utcnow()
+    if not settings.TEST_SERVER_MODE:
+        iam_backend = get_backend("iam")["global"]
+        iam_backend.users[username].access_keys[1].last_used = timestamp
+    with assert_raises(ClientError):
+        conn.get_credential_report()
+    result = conn.generate_credential_report()
+    while result["State"] != "COMPLETE":
+        result = conn.generate_credential_report()
+    result = conn.get_credential_report()
+    report = result["Content"].decode("utf-8")
+    header = report.split("\n")[0]
+    header.should.equal(
+        "user,arn,user_creation_time,password_enabled,password_last_used,password_last_changed,password_next_rotation,mfa_active,access_key_1_active,access_key_1_last_rotated,access_key_1_last_used_date,access_key_1_last_used_region,access_key_1_last_used_service,access_key_2_active,access_key_2_last_rotated,access_key_2_last_used_date,access_key_2_last_used_region,access_key_2_last_used_service,cert_1_active,cert_1_last_rotated,cert_2_active,cert_2_last_rotated"
+    )
+    report_dict = csv.DictReader(report.split("\n"))
+    user = next(report_dict)
+    user["user"].should.equal("my-user")
+    user["access_key_1_active"].should.equal("false")
+    user["access_key_1_last_rotated"].should.match(timestamp.strftime("%Y-%m-%d"))
+    user["access_key_1_last_used_date"].should.equal("N/A")
+    user["access_key_2_active"].should.equal("true")
+    if not settings.TEST_SERVER_MODE:
+        user["access_key_2_last_used_date"].should.match(timestamp.strftime("%Y-%m-%d"))
+    else:
+        user["access_key_2_last_used_date"].should.equal("N/A")
+
+
+@mock_iam
+def test_get_access_key_last_used_when_used():
+    iam = boto3.resource("iam", region_name="us-east-1")
+    client = iam.meta.client
+    username = "test-user"
+    iam.create_user(UserName=username)
+    with assert_raises(ClientError):
+        client.get_access_key_last_used(AccessKeyId="non-existent-key-id")
+    create_key_response = client.create_access_key(UserName=username)["AccessKey"]
+    # Set last used date using the IAM backend. Moto currently does not have a mechanism for tracking usage of access keys
+    if not settings.TEST_SERVER_MODE:
+        timestamp = datetime.utcnow()
+        iam_backend = get_backend("iam")["global"]
+        iam_backend.users[username].access_keys[0].last_used = timestamp
+    resp = client.get_access_key_last_used(
+        AccessKeyId=create_key_response["AccessKeyId"]
+    )
+    if not settings.TEST_SERVER_MODE:
+        datetime.strftime(
+            resp["AccessKeyLastUsed"]["LastUsedDate"], "%Y-%m-%d"
+        ).should.equal(timestamp.strftime("%Y-%m-%d"))
+    else:
+        resp["AccessKeyLastUsed"].should_not.contain("LastUsedDate")
+
+
 @requires_boto_gte("2.39")
 @mock_iam_deprecated()
 def test_managed_policy():
@@ -1326,10 +1441,13 @@ def test_update_access_key():
     )
     resp = client.list_access_keys(UserName=username)
     resp["AccessKeyMetadata"][0]["Status"].should.equal("Inactive")
+    client.update_access_key(AccessKeyId=key["AccessKeyId"], Status="Active")
+    resp = client.list_access_keys(UserName=username)
+    resp["AccessKeyMetadata"][0]["Status"].should.equal("Active")
 
 
 @mock_iam
-def test_get_access_key_last_used():
+def test_get_access_key_last_used_when_unused():
     iam = boto3.resource("iam", region_name="us-east-1")
     client = iam.meta.client
     username = "test-user"
@@ -1340,10 +1458,7 @@ def test_get_access_key_last_used():
     resp = client.get_access_key_last_used(
         AccessKeyId=create_key_response["AccessKeyId"]
     )
-
-    datetime.strftime(
-        resp["AccessKeyLastUsed"]["LastUsedDate"], "%Y-%m-%d"
-    ).should.equal(datetime.strftime(datetime.utcnow(), "%Y-%m-%d"))
+    resp["AccessKeyLastUsed"].should_not.contain("LastUsedDate")
     resp["UserName"].should.equal(create_key_response["UserName"])
 
 

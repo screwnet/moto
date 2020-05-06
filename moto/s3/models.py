@@ -12,6 +12,7 @@ import codecs
 import random
 import string
 import tempfile
+import threading
 import sys
 import time
 import uuid
@@ -19,8 +20,10 @@ import uuid
 import six
 
 from bisect import insort
-from moto.core import BaseBackend, BaseModel
+from moto.core import ACCOUNT_ID, BaseBackend, BaseModel
 from moto.core.utils import iso_8601_datetime_with_milliseconds, rfc_1123_datetime
+from moto.cloudwatch.models import MetricDatum
+from moto.utilities.tagging_service import TaggingService
 from .exceptions import (
     BucketAlreadyExists,
     MissingBucket,
@@ -33,10 +36,10 @@ from .exceptions import (
     MalformedXML,
     InvalidStorageClass,
     InvalidTargetBucketForLogging,
-    DuplicateTagKeys,
     CrossLocationLoggingProhibitted,
     NoSuchPublicAccessBlockConfiguration,
     InvalidPublicAccessBlockConfiguration,
+    WrongPublicAccessBlockAccountIdError,
 )
 from .utils import clean_key_name, _VersionedKeyStore
 
@@ -56,6 +59,13 @@ STORAGE_CLASS = [
 DEFAULT_KEY_BUFFER_SIZE = 16 * 1024 * 1024
 DEFAULT_TEXT_ENCODING = sys.getdefaultencoding()
 OWNER = "75aa57f09aa0c8caeab4f8c24e99d10f8e7faeebf76c078efc7c6caea54ba06a"
+
+
+def get_moto_s3_account_id():
+    """This makes it easy for mocking AWS Account IDs when using AWS Config
+       -- Simply mock.patch the ACCOUNT_ID here, and Config gets it for free.
+    """
+    return ACCOUNT_ID
 
 
 class FakeDeleteMarker(BaseModel):
@@ -85,6 +95,7 @@ class FakeKey(BaseModel):
         version_id=0,
         max_buffer_size=DEFAULT_KEY_BUFFER_SIZE,
         multipart=None,
+        bucket_name=None,
     ):
         self.name = name
         self.last_modified = datetime.datetime.utcnow()
@@ -96,12 +107,13 @@ class FakeKey(BaseModel):
         self._etag = etag
         self._version_id = version_id
         self._is_versioned = is_versioned
-        self._tagging = FakeTagging()
         self.multipart = multipart
+        self.bucket_name = bucket_name
 
         self._value_buffer = tempfile.SpooledTemporaryFile(max_size=max_buffer_size)
         self._max_buffer_size = max_buffer_size
         self.value = value
+        self.lock = threading.Lock()
 
     @property
     def version_id(self):
@@ -109,8 +121,19 @@ class FakeKey(BaseModel):
 
     @property
     def value(self):
+        self.lock.acquire()
         self._value_buffer.seek(0)
-        return self._value_buffer.read()
+        r = self._value_buffer.read()
+        r = copy.copy(r)
+        self.lock.release()
+        return r
+
+    @property
+    def arn(self):
+        # S3 Objects don't have an ARN, but we do need something unique when creating tags against this resource
+        return "arn:aws:s3:::{}/{}/{}".format(
+            self.bucket_name, self.name, self.version_id
+        )
 
     @value.setter
     def value(self, new_value):
@@ -122,6 +145,7 @@ class FakeKey(BaseModel):
         if isinstance(new_value, six.text_type):
             new_value = new_value.encode(DEFAULT_TEXT_ENCODING)
         self._value_buffer.write(new_value)
+        self.contentsize = len(new_value)
 
     def copy(self, new_name=None, new_is_versioned=None):
         r = copy.deepcopy(self)
@@ -137,9 +161,6 @@ class FakeKey(BaseModel):
             self._metadata = {}
         self._metadata.update(metadata)
 
-    def set_tagging(self, tagging):
-        self._tagging = tagging
-
     def set_storage_class(self, storage):
         if storage is not None and storage not in STORAGE_CLASS:
             raise InvalidStorageClass(storage=storage)
@@ -149,6 +170,7 @@ class FakeKey(BaseModel):
         self.acl = acl
 
     def append_to_value(self, value):
+        self.contentsize += len(value)
         self._value_buffer.seek(0, os.SEEK_END)
         self._value_buffer.write(value)
 
@@ -195,10 +217,6 @@ class FakeKey(BaseModel):
         return self._metadata
 
     @property
-    def tagging(self):
-        return self._tagging
-
-    @property
     def response_dict(self):
         res = {
             "ETag": self.etag,
@@ -221,8 +239,7 @@ class FakeKey(BaseModel):
 
     @property
     def size(self):
-        self._value_buffer.seek(0, os.SEEK_END)
-        return self._value_buffer.tell()
+        return self.contentsize
 
     @property
     def storage_class(self):
@@ -241,6 +258,7 @@ class FakeKey(BaseModel):
         state = self.__dict__.copy()
         state["value"] = self.value
         del state["_value_buffer"]
+        del state["lock"]
         return state
 
     def __setstate__(self, state):
@@ -250,6 +268,7 @@ class FakeKey(BaseModel):
             max_size=self._max_buffer_size
         )
         self.value = state["value"]
+        self.lock = threading.Lock()
 
 
 class FakeMultipart(BaseModel):
@@ -276,7 +295,7 @@ class FakeMultipart(BaseModel):
                 etag = etag.replace('"', "")
             if part is None or part_etag != etag:
                 raise InvalidPart()
-            if last is not None and len(last.value) < UPLOAD_PART_MIN_SIZE:
+            if last is not None and last.contentsize < UPLOAD_PART_MIN_SIZE:
                 raise EntityTooSmall()
             md5s.extend(decode_hex(part_etag)[0])
             total.extend(part.value)
@@ -454,26 +473,10 @@ def get_canned_acl(acl):
     return FakeAcl(grants=grants)
 
 
-class FakeTagging(BaseModel):
-    def __init__(self, tag_set=None):
-        self.tag_set = tag_set or FakeTagSet()
-
-
-class FakeTagSet(BaseModel):
-    def __init__(self, tags=None):
-        self.tags = tags or []
-
-
-class FakeTag(BaseModel):
-    def __init__(self, key, value=None):
-        self.key = key
-        self.value = value
-
-
 class LifecycleFilter(BaseModel):
     def __init__(self, prefix=None, tag=None, and_filter=None):
         self.prefix = prefix
-        self.tag = tag
+        (self.tag_key, self.tag_value) = tag if tag else (None, None)
         self.and_filter = and_filter
 
     def to_config_dict(self):
@@ -482,11 +485,11 @@ class LifecycleFilter(BaseModel):
                 "predicate": {"type": "LifecyclePrefixPredicate", "prefix": self.prefix}
             }
 
-        elif self.tag:
+        elif self.tag_key:
             return {
                 "predicate": {
                     "type": "LifecycleTagPredicate",
-                    "tag": {"key": self.tag.key, "value": self.tag.value},
+                    "tag": {"key": self.tag_key, "value": self.tag_value},
                 }
             }
 
@@ -510,12 +513,9 @@ class LifecycleAndFilter(BaseModel):
         if self.prefix is not None:
             data.append({"type": "LifecyclePrefixPredicate", "prefix": self.prefix})
 
-        for tag in self.tags:
+        for key, value in self.tags.items():
             data.append(
-                {
-                    "type": "LifecycleTagPredicate",
-                    "tag": {"key": tag.key, "value": tag.value},
-                }
+                {"type": "LifecycleTagPredicate", "tag": {"key": key, "value": value},}
             )
 
         return data
@@ -770,7 +770,6 @@ class FakeBucket(BaseModel):
         self.policy = None
         self.website_configuration = None
         self.acl = get_canned_acl("private")
-        self.tags = FakeTagging()
         self.cors = []
         self.logging = {}
         self.notification_configuration = None
@@ -862,7 +861,7 @@ class FakeBucket(BaseModel):
                 and_filter = None
                 if rule["Filter"].get("And"):
                     filters += 1
-                    and_tags = []
+                    and_tags = {}
                     if rule["Filter"]["And"].get("Tag"):
                         if not isinstance(rule["Filter"]["And"]["Tag"], list):
                             rule["Filter"]["And"]["Tag"] = [
@@ -870,7 +869,7 @@ class FakeBucket(BaseModel):
                             ]
 
                         for t in rule["Filter"]["And"]["Tag"]:
-                            and_tags.append(FakeTag(t["Key"], t.get("Value", "")))
+                            and_tags[t["Key"]] = t.get("Value", "")
 
                     try:
                         and_prefix = (
@@ -884,7 +883,7 @@ class FakeBucket(BaseModel):
                 filter_tag = None
                 if rule["Filter"].get("Tag"):
                     filters += 1
-                    filter_tag = FakeTag(
+                    filter_tag = (
                         rule["Filter"]["Tag"]["Key"],
                         rule["Filter"]["Tag"].get("Value", ""),
                     )
@@ -970,16 +969,6 @@ class FakeBucket(BaseModel):
 
     def delete_cors(self):
         self.cors = []
-
-    def set_tags(self, tagging):
-        self.tags = tagging
-
-    def delete_tags(self):
-        self.tags = FakeTagging()
-
-    @property
-    def tagging(self):
-        return self.tags
 
     def set_logging(self, logging_config, bucket_backend):
         if not logging_config:
@@ -1069,6 +1058,10 @@ class FakeBucket(BaseModel):
         self.acl = acl
 
     @property
+    def arn(self):
+        return "arn:aws:s3:::{}".format(self.name)
+
+    @property
     def physical_resource_id(self):
         return self.name
 
@@ -1093,7 +1086,7 @@ class FakeBucket(BaseModel):
                 int(time.mktime(self.creation_date.timetuple()))
             ),  # PY2 and 3 compatible
             "configurationItemMD5Hash": "",
-            "arn": "arn:aws:s3:::{}".format(self.name),
+            "arn": self.arn,
             "resourceType": "AWS::S3::Bucket",
             "resourceId": self.name,
             "resourceName": self.name,
@@ -1102,7 +1095,7 @@ class FakeBucket(BaseModel):
             "resourceCreationTime": str(self.creation_date),
             "relatedEvents": [],
             "relationships": [],
-            "tags": {tag.key: tag.value for tag in self.tagging.tag_set.tags},
+            "tags": s3_backend.tagger.get_tag_dict_for_resource(self.arn),
             "configuration": {
                 "name": self.name,
                 "owner": {"id": OWNER},
@@ -1163,6 +1156,43 @@ class FakeBucket(BaseModel):
 class S3Backend(BaseBackend):
     def __init__(self):
         self.buckets = {}
+        self.account_public_access_block = None
+        self.tagger = TaggingService()
+
+        # TODO: This is broken! DO NOT IMPORT MUTABLE DATA TYPES FROM OTHER AREAS -- THIS BREAKS UNMOCKING!
+        # WRAP WITH A GETTER/SETTER FUNCTION
+        # Register this class as a CloudWatch Metric Provider
+        # Must provide a method 'get_cloudwatch_metrics' that will return a list of metrics, based on the data available
+        # metric_providers["S3"] = self
+
+    def get_cloudwatch_metrics(self):
+        metrics = []
+        for name, bucket in self.buckets.items():
+            metrics.append(
+                MetricDatum(
+                    namespace="AWS/S3",
+                    name="BucketSizeBytes",
+                    value=bucket.keys.item_size(),
+                    dimensions=[
+                        {"Name": "StorageType", "Value": "StandardStorage"},
+                        {"Name": "BucketName", "Value": name},
+                    ],
+                    timestamp=datetime.datetime.now(),
+                )
+            )
+            metrics.append(
+                MetricDatum(
+                    namespace="AWS/S3",
+                    name="NumberOfObjects",
+                    value=len(bucket.keys),
+                    dimensions=[
+                        {"Name": "StorageType", "Value": "AllStorageTypes"},
+                        {"Name": "BucketName", "Value": name},
+                    ],
+                    timestamp=datetime.datetime.now(),
+                )
+            )
+        return metrics
 
     def create_bucket(self, bucket_name, region_name):
         if bucket_name in self.buckets:
@@ -1264,6 +1294,16 @@ class S3Backend(BaseBackend):
 
         return bucket.public_access_block
 
+    def get_account_public_access_block(self, account_id):
+        # The account ID should equal the account id that is set for Moto:
+        if account_id != ACCOUNT_ID:
+            raise WrongPublicAccessBlockAccountIdError()
+
+        if not self.account_public_access_block:
+            raise NoSuchPublicAccessBlockConfiguration()
+
+        return self.account_public_access_block
+
     def set_key(
         self, bucket_name, key_name, value, storage=None, etag=None, multipart=None
     ):
@@ -1322,23 +1362,32 @@ class S3Backend(BaseBackend):
         else:
             return None
 
-    def set_key_tagging(self, bucket_name, key_name, tagging, version_id=None):
-        key = self.get_key(bucket_name, key_name, version_id)
+    def get_key_tags(self, key):
+        return self.tagger.list_tags_for_resource(key.arn)
+
+    def set_key_tags(self, key, tags, key_name=None):
         if key is None:
             raise MissingKey(key_name)
-        key.set_tagging(tagging)
+        self.tagger.delete_all_tags_for_resource(key.arn)
+        self.tagger.tag_resource(
+            key.arn, [{"Key": k, "Value": v} for (k, v) in tags.items()],
+        )
         return key
 
-    def put_bucket_tagging(self, bucket_name, tagging):
-        tag_keys = [tag.key for tag in tagging.tag_set.tags]
-        if len(tag_keys) != len(set(tag_keys)):
-            raise DuplicateTagKeys()
+    def get_bucket_tags(self, bucket_name):
         bucket = self.get_bucket(bucket_name)
-        bucket.set_tags(tagging)
+        return self.tagger.list_tags_for_resource(bucket.arn)
+
+    def put_bucket_tags(self, bucket_name, tags):
+        bucket = self.get_bucket(bucket_name)
+        self.tagger.delete_all_tags_for_resource(bucket.arn)
+        self.tagger.tag_resource(
+            bucket.arn, [{"Key": key, "Value": value} for key, value in tags.items()],
+        )
 
     def delete_bucket_tagging(self, bucket_name):
         bucket = self.get_bucket(bucket_name)
-        bucket.delete_tags()
+        self.tagger.delete_all_tags_for_resource(bucket.arn)
 
     def put_bucket_cors(self, bucket_name, cors_rules):
         bucket = self.get_bucket(bucket_name)
@@ -1355,6 +1404,13 @@ class S3Backend(BaseBackend):
     def delete_bucket_public_access_block(self, bucket_name):
         bucket = self.get_bucket(bucket_name)
         bucket.public_access_block = None
+
+    def delete_account_public_access_block(self, account_id):
+        # The account ID should equal the account id that is set for Moto:
+        if account_id != ACCOUNT_ID:
+            raise WrongPublicAccessBlockAccountIdError()
+
+        self.account_public_access_block = None
 
     def put_bucket_notification_configuration(self, bucket_name, notification_config):
         bucket = self.get_bucket(bucket_name)
@@ -1378,6 +1434,21 @@ class S3Backend(BaseBackend):
             raise InvalidPublicAccessBlockConfiguration()
 
         bucket.public_access_block = PublicAccessBlock(
+            pub_block_config.get("BlockPublicAcls"),
+            pub_block_config.get("IgnorePublicAcls"),
+            pub_block_config.get("BlockPublicPolicy"),
+            pub_block_config.get("RestrictPublicBuckets"),
+        )
+
+    def put_account_public_access_block(self, account_id, pub_block_config):
+        # The account ID should equal the account id that is set for Moto:
+        if account_id != ACCOUNT_ID:
+            raise WrongPublicAccessBlockAccountIdError()
+
+        if not pub_block_config:
+            raise InvalidPublicAccessBlockConfiguration()
+
+        self.account_public_access_block = PublicAccessBlock(
             pub_block_config.get("BlockPublicAcls"),
             pub_block_config.get("IgnorePublicAcls"),
             pub_block_config.get("BlockPublicPolicy"),
@@ -1524,6 +1595,7 @@ class S3Backend(BaseBackend):
         key = self.get_key(src_bucket_name, src_key_name, version_id=src_version_id)
 
         new_key = key.copy(dest_key_name, dest_bucket.is_versioned)
+        self.tagger.copy_tags(key.arn, new_key.arn)
 
         if storage is not None:
             new_key.set_storage_class(storage)

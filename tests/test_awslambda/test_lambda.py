@@ -58,8 +58,7 @@ def lambda_handler(event, context):
     volume_id = event.get('volume_id')
     vol = ec2.Volume(volume_id)
 
-    print('get volume details for %s\\nVolume - %s  state=%s, size=%s' % (volume_id, volume_id, vol.state, vol.size))
-    return event
+    return {{'id': vol.id, 'state': vol.state, 'size': vol.size}}
 """.format(
         base_url="motoserver:5000"
         if settings.TEST_SERVER_MODE
@@ -71,6 +70,7 @@ def lambda_handler(event, context):
 def get_test_zip_file3():
     pfunc = """
 def lambda_handler(event, context):
+    print("Nr_of_records("+str(len(event['Records']))+")")
     print("get_test_zip_file3 success")
     return event
 """
@@ -79,7 +79,7 @@ def lambda_handler(event, context):
 
 def get_test_zip_file4():
     pfunc = """
-def lambda_handler(event, context):    
+def lambda_handler(event, context):
     raise Exception('I failed!')
 """
     return _process_lambda(pfunc)
@@ -87,14 +87,14 @@ def lambda_handler(event, context):
 
 @mock_lambda
 def test_list_functions():
-    conn = boto3.client("lambda", "us-west-2")
+    conn = boto3.client("lambda", _lambda_region)
     result = conn.list_functions()
     result["Functions"].should.have.length_of(0)
 
 
 @mock_lambda
 def test_invoke_requestresponse_function():
-    conn = boto3.client("lambda", "us-west-2")
+    conn = boto3.client("lambda", _lambda_region)
     conn.create_function(
         FunctionName="testFunction",
         Runtime="python2.7",
@@ -114,7 +114,44 @@ def test_invoke_requestresponse_function():
         Payload=json.dumps(in_data),
     )
 
-    success_result["StatusCode"].should.equal(202)
+    success_result["StatusCode"].should.equal(200)
+    result_obj = json.loads(
+        base64.b64decode(success_result["LogResult"]).decode("utf-8")
+    )
+
+    result_obj.should.equal(in_data)
+
+    payload = success_result["Payload"].read().decode("utf-8")
+    json.loads(payload).should.equal(in_data)
+
+
+@mock_lambda
+def test_invoke_requestresponse_function_with_arn():
+    from moto.awslambda.models import ACCOUNT_ID
+
+    conn = boto3.client("lambda", "us-west-2")
+    conn.create_function(
+        FunctionName="testFunction",
+        Runtime="python2.7",
+        Role=get_role_name(),
+        Handler="lambda_function.lambda_handler",
+        Code={"ZipFile": get_test_zip_file1()},
+        Description="test lambda function",
+        Timeout=3,
+        MemorySize=128,
+        Publish=True,
+    )
+
+    in_data = {"msg": "So long and thanks for all the fish"}
+    success_result = conn.invoke(
+        FunctionName="arn:aws:lambda:us-west-2:{}:function:testFunction".format(
+            ACCOUNT_ID
+        ),
+        InvocationType="RequestResponse",
+        Payload=json.dumps(in_data),
+    )
+
+    success_result["StatusCode"].should.equal(200)
     result_obj = json.loads(
         base64.b64decode(success_result["LogResult"]).decode("utf-8")
     )
@@ -127,7 +164,7 @@ def test_invoke_requestresponse_function():
 
 @mock_lambda
 def test_invoke_event_function():
-    conn = boto3.client("lambda", "us-west-2")
+    conn = boto3.client("lambda", _lambda_region)
     conn.create_function(
         FunctionName="testFunction",
         Runtime="python2.7",
@@ -149,7 +186,35 @@ def test_invoke_event_function():
         FunctionName="testFunction", InvocationType="Event", Payload=json.dumps(in_data)
     )
     success_result["StatusCode"].should.equal(202)
-    json.loads(success_result["Payload"].read().decode("utf-8")).should.equal({})
+    json.loads(success_result["Payload"].read().decode("utf-8")).should.equal(in_data)
+
+
+@mock_lambda
+def test_invoke_dryrun_function():
+    conn = boto3.client("lambda", _lambda_region)
+    conn.create_function(
+        FunctionName="testFunction",
+        Runtime="python2.7",
+        Role=get_role_name(),
+        Handler="lambda_function.lambda_handler",
+        Code={"ZipFile": get_test_zip_file1(),},
+        Description="test lambda function",
+        Timeout=3,
+        MemorySize=128,
+        Publish=True,
+    )
+
+    conn.invoke.when.called_with(
+        FunctionName="notAFunction", InvocationType="Event", Payload="{}"
+    ).should.throw(botocore.client.ClientError)
+
+    in_data = {"msg": "So long and thanks for all the fish"}
+    success_result = conn.invoke(
+        FunctionName="testFunction",
+        InvocationType="DryRun",
+        Payload=json.dumps(in_data),
+    )
+    success_result["StatusCode"].should.equal(204)
 
 
 if settings.TEST_SERVER_MODE:
@@ -157,11 +222,11 @@ if settings.TEST_SERVER_MODE:
     @mock_ec2
     @mock_lambda
     def test_invoke_function_get_ec2_volume():
-        conn = boto3.resource("ec2", "us-west-2")
-        vol = conn.create_volume(Size=99, AvailabilityZone="us-west-2")
+        conn = boto3.resource("ec2", _lambda_region)
+        vol = conn.create_volume(Size=99, AvailabilityZone=_lambda_region)
         vol = conn.Volume(vol.id)
 
-        conn = boto3.client("lambda", "us-west-2")
+        conn = boto3.client("lambda", _lambda_region)
         conn.create_function(
             FunctionName="testFunction",
             Runtime="python3.7",
@@ -180,28 +245,10 @@ if settings.TEST_SERVER_MODE:
             InvocationType="RequestResponse",
             Payload=json.dumps(in_data),
         )
-        result["StatusCode"].should.equal(202)
-        msg = "get volume details for %s\nVolume - %s  state=%s, size=%s\n%s" % (
-            vol.id,
-            vol.id,
-            vol.state,
-            vol.size,
-            json.dumps(in_data).replace(
-                " ", ""
-            ),  # Makes the tests pass as the result is missing the whitespace
-        )
-
-        log_result = base64.b64decode(result["LogResult"]).decode("utf-8")
-
-        # The Docker lambda invocation will return an additional '\n', so need to replace it:
-        log_result = log_result.replace("\n\n", "\n")
-        log_result.should.equal(msg)
-
-        payload = result["Payload"].read().decode("utf-8")
-
-        # The Docker lambda invocation will return an additional '\n', so need to replace it:
-        payload = payload.replace("\n\n", "\n")
-        payload.should.equal(msg)
+        result["StatusCode"].should.equal(200)
+        actual_payload = json.loads(result["Payload"].read().decode("utf-8"))
+        expected_payload = {"id": vol.id, "state": vol.state, "size": vol.size}
+        actual_payload.should.equal(expected_payload)
 
 
 @mock_logs
@@ -209,14 +256,14 @@ if settings.TEST_SERVER_MODE:
 @mock_ec2
 @mock_lambda
 def test_invoke_function_from_sns():
-    logs_conn = boto3.client("logs", region_name="us-west-2")
-    sns_conn = boto3.client("sns", region_name="us-west-2")
+    logs_conn = boto3.client("logs", region_name=_lambda_region)
+    sns_conn = boto3.client("sns", region_name=_lambda_region)
     sns_conn.create_topic(Name="some-topic")
     topics_json = sns_conn.list_topics()
     topics = topics_json["Topics"]
     topic_arn = topics[0]["TopicArn"]
 
-    conn = boto3.client("lambda", "us-west-2")
+    conn = boto3.client("lambda", _lambda_region)
     result = conn.create_function(
         FunctionName="testFunction",
         Runtime="python2.7",
@@ -259,7 +306,7 @@ def test_invoke_function_from_sns():
 
 @mock_lambda
 def test_create_based_on_s3_with_missing_bucket():
-    conn = boto3.client("lambda", "us-west-2")
+    conn = boto3.client("lambda", _lambda_region)
 
     conn.create_function.when.called_with(
         FunctionName="testFunction",
@@ -279,12 +326,15 @@ def test_create_based_on_s3_with_missing_bucket():
 @mock_s3
 @freeze_time("2015-01-01 00:00:00")
 def test_create_function_from_aws_bucket():
-    s3_conn = boto3.client("s3", "us-west-2")
-    s3_conn.create_bucket(Bucket="test-bucket")
+    s3_conn = boto3.client("s3", _lambda_region)
+    s3_conn.create_bucket(
+        Bucket="test-bucket",
+        CreateBucketConfiguration={"LocationConstraint": _lambda_region},
+    )
     zip_content = get_test_zip_file2()
 
     s3_conn.put_object(Bucket="test-bucket", Key="test.zip", Body=zip_content)
-    conn = boto3.client("lambda", "us-west-2")
+    conn = boto3.client("lambda", _lambda_region)
 
     result = conn.create_function(
         FunctionName="testFunction",
@@ -324,6 +374,7 @@ def test_create_function_from_aws_bucket():
                 "VpcId": "vpc-123abc",
             },
             "ResponseMetadata": {"HTTPStatusCode": 201},
+            "State": "Active",
         }
     )
 
@@ -331,7 +382,7 @@ def test_create_function_from_aws_bucket():
 @mock_lambda
 @freeze_time("2015-01-01 00:00:00")
 def test_create_function_from_zipfile():
-    conn = boto3.client("lambda", "us-west-2")
+    conn = boto3.client("lambda", _lambda_region)
     zip_content = get_test_zip_file1()
     result = conn.create_function(
         FunctionName="testFunction",
@@ -367,6 +418,7 @@ def test_create_function_from_zipfile():
             "Version": "1",
             "VpcConfig": {"SecurityGroupIds": [], "SubnetIds": []},
             "ResponseMetadata": {"HTTPStatusCode": 201},
+            "State": "Active",
         }
     )
 
@@ -375,12 +427,15 @@ def test_create_function_from_zipfile():
 @mock_s3
 @freeze_time("2015-01-01 00:00:00")
 def test_get_function():
-    s3_conn = boto3.client("s3", "us-west-2")
-    s3_conn.create_bucket(Bucket="test-bucket")
+    s3_conn = boto3.client("s3", _lambda_region)
+    s3_conn.create_bucket(
+        Bucket="test-bucket",
+        CreateBucketConfiguration={"LocationConstraint": _lambda_region},
+    )
 
     zip_content = get_test_zip_file1()
     s3_conn.put_object(Bucket="test-bucket", Key="test.zip", Body=zip_content)
-    conn = boto3.client("lambda", "us-west-2")
+    conn = boto3.client("lambda", _lambda_region)
 
     conn.create_function(
         FunctionName="testFunction",
@@ -435,7 +490,7 @@ def test_get_function():
     )
 
     # Test get function when can't find function name
-    with assert_raises(ClientError):
+    with assert_raises(conn.exceptions.ResourceNotFoundException):
         conn.get_function(FunctionName="junk", Qualifier="$LATEST")
 
 
@@ -444,7 +499,10 @@ def test_get_function():
 def test_get_function_by_arn():
     bucket_name = "test-bucket"
     s3_conn = boto3.client("s3", "us-east-1")
-    s3_conn.create_bucket(Bucket=bucket_name)
+    s3_conn.create_bucket(
+        Bucket=bucket_name,
+        CreateBucketConfiguration={"LocationConstraint": _lambda_region},
+    )
 
     zip_content = get_test_zip_file2()
     s3_conn.put_object(Bucket=bucket_name, Key="test.zip", Body=zip_content)
@@ -469,12 +527,15 @@ def test_get_function_by_arn():
 @mock_lambda
 @mock_s3
 def test_delete_function():
-    s3_conn = boto3.client("s3", "us-west-2")
-    s3_conn.create_bucket(Bucket="test-bucket")
+    s3_conn = boto3.client("s3", _lambda_region)
+    s3_conn.create_bucket(
+        Bucket="test-bucket",
+        CreateBucketConfiguration={"LocationConstraint": _lambda_region},
+    )
 
     zip_content = get_test_zip_file2()
     s3_conn.put_object(Bucket="test-bucket", Key="test.zip", Body=zip_content)
-    conn = boto3.client("lambda", "us-west-2")
+    conn = boto3.client("lambda", _lambda_region)
 
     conn.create_function(
         FunctionName="testFunction",
@@ -505,7 +566,10 @@ def test_delete_function():
 def test_delete_function_by_arn():
     bucket_name = "test-bucket"
     s3_conn = boto3.client("s3", "us-east-1")
-    s3_conn.create_bucket(Bucket=bucket_name)
+    s3_conn.create_bucket(
+        Bucket=bucket_name,
+        CreateBucketConfiguration={"LocationConstraint": _lambda_region},
+    )
 
     zip_content = get_test_zip_file2()
     s3_conn.put_object(Bucket=bucket_name, Key="test.zip", Body=zip_content)
@@ -530,7 +594,7 @@ def test_delete_function_by_arn():
 
 @mock_lambda
 def test_delete_unknown_function():
-    conn = boto3.client("lambda", "us-west-2")
+    conn = boto3.client("lambda", _lambda_region)
     conn.delete_function.when.called_with(
         FunctionName="testFunctionThatDoesntExist"
     ).should.throw(botocore.client.ClientError)
@@ -539,12 +603,15 @@ def test_delete_unknown_function():
 @mock_lambda
 @mock_s3
 def test_publish():
-    s3_conn = boto3.client("s3", "us-west-2")
-    s3_conn.create_bucket(Bucket="test-bucket")
+    s3_conn = boto3.client("s3", _lambda_region)
+    s3_conn.create_bucket(
+        Bucket="test-bucket",
+        CreateBucketConfiguration={"LocationConstraint": _lambda_region},
+    )
 
     zip_content = get_test_zip_file2()
     s3_conn.put_object(Bucket="test-bucket", Key="test.zip", Body=zip_content)
-    conn = boto3.client("lambda", "us-west-2")
+    conn = boto3.client("lambda", _lambda_region)
 
     conn.create_function(
         FunctionName="testFunction",
@@ -589,12 +656,15 @@ def test_list_create_list_get_delete_list():
     test `list -> create -> list -> get -> delete -> list` integration
 
     """
-    s3_conn = boto3.client("s3", "us-west-2")
-    s3_conn.create_bucket(Bucket="test-bucket")
+    s3_conn = boto3.client("s3", _lambda_region)
+    s3_conn.create_bucket(
+        Bucket="test-bucket",
+        CreateBucketConfiguration={"LocationConstraint": _lambda_region},
+    )
 
     zip_content = get_test_zip_file2()
     s3_conn.put_object(Bucket="test-bucket", Key="test.zip", Body=zip_content)
-    conn = boto3.client("lambda", "us-west-2")
+    conn = boto3.client("lambda", _lambda_region)
 
     conn.list_functions()["Functions"].should.have.length_of(0)
 
@@ -631,6 +701,7 @@ def test_list_create_list_get_delete_list():
             "Timeout": 3,
             "Version": "$LATEST",
             "VpcConfig": {"SecurityGroupIds": [], "SubnetIds": []},
+            "State": "Active",
         },
         "ResponseMetadata": {"HTTPStatusCode": 200},
     }
@@ -690,12 +761,15 @@ def test_tags():
     """
     test list_tags -> tag_resource -> list_tags -> tag_resource -> list_tags -> untag_resource -> list_tags integration
     """
-    s3_conn = boto3.client("s3", "us-west-2")
-    s3_conn.create_bucket(Bucket="test-bucket")
+    s3_conn = boto3.client("s3", _lambda_region)
+    s3_conn.create_bucket(
+        Bucket="test-bucket",
+        CreateBucketConfiguration={"LocationConstraint": _lambda_region},
+    )
 
     zip_content = get_test_zip_file2()
     s3_conn.put_object(Bucket="test-bucket", Key="test.zip", Body=zip_content)
-    conn = boto3.client("lambda", "us-west-2")
+    conn = boto3.client("lambda", _lambda_region)
 
     function = conn.create_function(
         FunctionName="testFunction",
@@ -747,7 +821,7 @@ def test_tags_not_found():
     """
     Test list_tags and tag_resource when the lambda with the given arn does not exist
     """
-    conn = boto3.client("lambda", "us-west-2")
+    conn = boto3.client("lambda", _lambda_region)
     conn.list_tags.when.called_with(
         Resource="arn:aws:lambda:{}:function:not-found".format(ACCOUNT_ID)
     ).should.throw(botocore.client.ClientError)
@@ -765,7 +839,7 @@ def test_tags_not_found():
 
 @mock_lambda
 def test_invoke_async_function():
-    conn = boto3.client("lambda", "us-west-2")
+    conn = boto3.client("lambda", _lambda_region)
     conn.create_function(
         FunctionName="testFunction",
         Runtime="python2.7",
@@ -788,7 +862,7 @@ def test_invoke_async_function():
 @mock_lambda
 @freeze_time("2015-01-01 00:00:00")
 def test_get_function_created_with_zipfile():
-    conn = boto3.client("lambda", "us-west-2")
+    conn = boto3.client("lambda", _lambda_region)
     zip_content = get_test_zip_file1()
     result = conn.create_function(
         FunctionName="testFunction",
@@ -827,13 +901,14 @@ def test_get_function_created_with_zipfile():
             "Timeout": 3,
             "Version": "$LATEST",
             "VpcConfig": {"SecurityGroupIds": [], "SubnetIds": []},
+            "State": "Active",
         }
     )
 
 
 @mock_lambda
 def test_add_function_permission():
-    conn = boto3.client("lambda", "us-west-2")
+    conn = boto3.client("lambda", _lambda_region)
     zip_content = get_test_zip_file1()
     conn.create_function(
         FunctionName="testFunction",
@@ -864,7 +939,7 @@ def test_add_function_permission():
 
 @mock_lambda
 def test_get_function_policy():
-    conn = boto3.client("lambda", "us-west-2")
+    conn = boto3.client("lambda", _lambda_region)
     zip_content = get_test_zip_file1()
     conn.create_function(
         FunctionName="testFunction",
@@ -899,12 +974,15 @@ def test_get_function_policy():
 @mock_lambda
 @mock_s3
 def test_list_versions_by_function():
-    s3_conn = boto3.client("s3", "us-west-2")
-    s3_conn.create_bucket(Bucket="test-bucket")
+    s3_conn = boto3.client("s3", _lambda_region)
+    s3_conn.create_bucket(
+        Bucket="test-bucket",
+        CreateBucketConfiguration={"LocationConstraint": _lambda_region},
+    )
 
     zip_content = get_test_zip_file2()
     s3_conn.put_object(Bucket="test-bucket", Key="test.zip", Body=zip_content)
-    conn = boto3.client("lambda", "us-west-2")
+    conn = boto3.client("lambda", _lambda_region)
 
     conn.create_function(
         FunctionName="testFunction",
@@ -955,12 +1033,15 @@ def test_list_versions_by_function():
 @mock_lambda
 @mock_s3
 def test_create_function_with_already_exists():
-    s3_conn = boto3.client("s3", "us-west-2")
-    s3_conn.create_bucket(Bucket="test-bucket")
+    s3_conn = boto3.client("s3", _lambda_region)
+    s3_conn.create_bucket(
+        Bucket="test-bucket",
+        CreateBucketConfiguration={"LocationConstraint": _lambda_region},
+    )
 
     zip_content = get_test_zip_file2()
     s3_conn.put_object(Bucket="test-bucket", Key="test.zip", Body=zip_content)
-    conn = boto3.client("lambda", "us-west-2")
+    conn = boto3.client("lambda", _lambda_region)
 
     conn.create_function(
         FunctionName="testFunction",
@@ -992,7 +1073,7 @@ def test_create_function_with_already_exists():
 @mock_lambda
 @mock_s3
 def test_list_versions_by_function_for_nonexistent_function():
-    conn = boto3.client("lambda", "us-west-2")
+    conn = boto3.client("lambda", _lambda_region)
     versions = conn.list_versions_by_function(FunctionName="testFunction")
 
     assert len(versions["Versions"]) == 0
@@ -1031,7 +1112,6 @@ def test_create_event_source_mapping():
 @mock_lambda
 @mock_sqs
 def test_invoke_function_from_sqs():
-    logs_conn = boto3.client("logs", region_name="us-east-1")
     sqs = boto3.resource("sqs", region_name="us-east-1")
     queue = sqs.create_queue(QueueName="test-sqs-queue1")
 
@@ -1057,32 +1137,22 @@ def test_invoke_function_from_sqs():
 
     sqs_client = boto3.client("sqs", region_name="us-east-1")
     sqs_client.send_message(QueueUrl=queue.url, MessageBody="test")
-    start = time.time()
-    while (time.time() - start) < 30:
-        result = logs_conn.describe_log_streams(logGroupName="/aws/lambda/testFunction")
-        log_streams = result.get("logStreams")
-        if not log_streams:
-            time.sleep(1)
-            continue
 
-        assert len(log_streams) == 1
-        result = logs_conn.get_log_events(
-            logGroupName="/aws/lambda/testFunction",
-            logStreamName=log_streams[0]["logStreamName"],
-        )
-        for event in result.get("events"):
-            if event["message"] == "get_test_zip_file3 success":
-                return
-        time.sleep(1)
+    expected_msg = "get_test_zip_file3 success"
+    log_group = "/aws/lambda/testFunction"
+    msg_showed_up, all_logs = wait_for_log_msg(expected_msg, log_group)
 
-    assert False, "Test Failed"
+    assert msg_showed_up, (
+        expected_msg
+        + " was not found after sending an SQS message. All logs: "
+        + all_logs
+    )
 
 
 @mock_logs
 @mock_lambda
 @mock_dynamodb2
-def test_invoke_function_from_dynamodb():
-    logs_conn = boto3.client("logs", region_name="us-east-1")
+def test_invoke_function_from_dynamodb_put():
     dynamodb = boto3.client("dynamodb", region_name="us-east-1")
     table_name = "table_with_stream"
     table = dynamodb.create_table(
@@ -1117,25 +1187,96 @@ def test_invoke_function_from_dynamodb():
     assert response["State"] == "Enabled"
 
     dynamodb.put_item(TableName=table_name, Item={"id": {"S": "item 1"}})
+
+    expected_msg = "get_test_zip_file3 success"
+    log_group = "/aws/lambda/testFunction"
+    msg_showed_up, all_logs = wait_for_log_msg(expected_msg, log_group)
+
+    assert msg_showed_up, (
+        expected_msg + " was not found after a DDB insert. All logs: " + all_logs
+    )
+
+
+@mock_logs
+@mock_lambda
+@mock_dynamodb2
+def test_invoke_function_from_dynamodb_update():
+    dynamodb = boto3.client("dynamodb", region_name="us-east-1")
+    table_name = "table_with_stream"
+    table = dynamodb.create_table(
+        TableName=table_name,
+        KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "S"}],
+        StreamSpecification={
+            "StreamEnabled": True,
+            "StreamViewType": "NEW_AND_OLD_IMAGES",
+        },
+    )
+
+    conn = boto3.client("lambda", region_name="us-east-1")
+    func = conn.create_function(
+        FunctionName="testFunction",
+        Runtime="python2.7",
+        Role=get_role_name(),
+        Handler="lambda_function.lambda_handler",
+        Code={"ZipFile": get_test_zip_file3()},
+        Description="test lambda function executed after a DynamoDB table is updated",
+        Timeout=3,
+        MemorySize=128,
+        Publish=True,
+    )
+
+    conn.create_event_source_mapping(
+        EventSourceArn=table["TableDescription"]["LatestStreamArn"],
+        FunctionName=func["FunctionArn"],
+    )
+
+    dynamodb.put_item(TableName=table_name, Item={"id": {"S": "item 1"}})
+    log_group = "/aws/lambda/testFunction"
+    expected_msg = "get_test_zip_file3 success"
+    msg_showed_up, all_logs = wait_for_log_msg(expected_msg, log_group)
+    assert "Nr_of_records(1)" in all_logs, "Only one item should be inserted"
+
+    dynamodb.update_item(
+        TableName=table_name,
+        Key={"id": {"S": "item 1"}},
+        UpdateExpression="set #attr = :val",
+        ExpressionAttributeNames={"#attr": "new_attr"},
+        ExpressionAttributeValues={":val": {"S": "new_val"}},
+    )
+    msg_showed_up, all_logs = wait_for_log_msg(expected_msg, log_group)
+
+    assert msg_showed_up, (
+        expected_msg + " was not found after updating DDB. All logs: " + str(all_logs)
+    )
+    assert "Nr_of_records(1)" in all_logs, "Only one item should be updated"
+    assert (
+        "Nr_of_records(2)" not in all_logs
+    ), "The inserted item should not show up again"
+
+
+def wait_for_log_msg(expected_msg, log_group):
+    logs_conn = boto3.client("logs", region_name="us-east-1")
+    received_messages = []
     start = time.time()
-    while (time.time() - start) < 30:
-        result = logs_conn.describe_log_streams(logGroupName="/aws/lambda/testFunction")
+    while (time.time() - start) < 10:
+        result = logs_conn.describe_log_streams(logGroupName=log_group)
         log_streams = result.get("logStreams")
         if not log_streams:
             time.sleep(1)
             continue
 
-        assert len(log_streams) == 1
-        result = logs_conn.get_log_events(
-            logGroupName="/aws/lambda/testFunction",
-            logStreamName=log_streams[0]["logStreamName"],
-        )
-        for event in result.get("events"):
-            if event["message"] == "get_test_zip_file3 success":
-                return
+        for log_stream in log_streams:
+            result = logs_conn.get_log_events(
+                logGroupName=log_group, logStreamName=log_stream["logStreamName"],
+            )
+            received_messages.extend(
+                [event["message"] for event in result.get("events")]
+            )
+        if expected_msg in received_messages:
+            return True, received_messages
         time.sleep(1)
-
-    assert False, "Test Failed"
+    return False, received_messages
 
 
 @mock_logs
@@ -1341,12 +1482,15 @@ def test_delete_event_source_mapping():
 @mock_lambda
 @mock_s3
 def test_update_configuration():
-    s3_conn = boto3.client("s3", "us-west-2")
-    s3_conn.create_bucket(Bucket="test-bucket")
+    s3_conn = boto3.client("s3", _lambda_region)
+    s3_conn.create_bucket(
+        Bucket="test-bucket",
+        CreateBucketConfiguration={"LocationConstraint": _lambda_region},
+    )
 
     zip_content = get_test_zip_file2()
     s3_conn.put_object(Bucket="test-bucket", Key="test.zip", Body=zip_content)
-    conn = boto3.client("lambda", "us-west-2")
+    conn = boto3.client("lambda", _lambda_region)
 
     fxn = conn.create_function(
         FunctionName="testFunction",
@@ -1389,7 +1533,7 @@ def test_update_configuration():
 
 @mock_lambda
 def test_update_function_zip():
-    conn = boto3.client("lambda", "us-west-2")
+    conn = boto3.client("lambda", _lambda_region)
 
     zip_content_one = get_test_zip_file1()
 
@@ -1436,6 +1580,7 @@ def test_update_function_zip():
             "Timeout": 3,
             "Version": "2",
             "VpcConfig": {"SecurityGroupIds": [], "SubnetIds": []},
+            "State": "Active",
         }
     )
 
@@ -1443,13 +1588,16 @@ def test_update_function_zip():
 @mock_lambda
 @mock_s3
 def test_update_function_s3():
-    s3_conn = boto3.client("s3", "us-west-2")
-    s3_conn.create_bucket(Bucket="test-bucket")
+    s3_conn = boto3.client("s3", _lambda_region)
+    s3_conn.create_bucket(
+        Bucket="test-bucket",
+        CreateBucketConfiguration={"LocationConstraint": _lambda_region},
+    )
 
     zip_content = get_test_zip_file1()
     s3_conn.put_object(Bucket="test-bucket", Key="test.zip", Body=zip_content)
 
-    conn = boto3.client("lambda", "us-west-2")
+    conn = boto3.client("lambda", _lambda_region)
 
     fxn = conn.create_function(
         FunctionName="testFunctionS3",
@@ -1498,6 +1646,7 @@ def test_update_function_s3():
             "Timeout": 3,
             "Version": "2",
             "VpcConfig": {"SecurityGroupIds": [], "SubnetIds": []},
+            "State": "Active",
         }
     )
 
@@ -1528,8 +1677,44 @@ def test_create_function_with_unknown_arn():
     )
 
 
+@mock_lambda
+def test_remove_function_permission():
+    conn = boto3.client("lambda", _lambda_region)
+    zip_content = get_test_zip_file1()
+    conn.create_function(
+        FunctionName="testFunction",
+        Runtime="python2.7",
+        Role=(get_role_name()),
+        Handler="lambda_function.handler",
+        Code={"ZipFile": zip_content},
+        Description="test lambda function",
+        Timeout=3,
+        MemorySize=128,
+        Publish=True,
+    )
+
+    conn.add_permission(
+        FunctionName="testFunction",
+        StatementId="1",
+        Action="lambda:InvokeFunction",
+        Principal="432143214321",
+        SourceArn="arn:aws:lambda:us-west-2:account-id:function:helloworld",
+        SourceAccount="123412341234",
+        EventSourceToken="blah",
+        Qualifier="2",
+    )
+
+    remove = conn.remove_permission(
+        FunctionName="testFunction", StatementId="1", Qualifier="2",
+    )
+    remove["ResponseMetadata"]["HTTPStatusCode"].should.equal(204)
+    policy = conn.get_policy(FunctionName="testFunction", Qualifier="2")["Policy"]
+    policy = json.loads(policy)
+    policy["Statement"].should.equal([])
+
+
 def create_invalid_lambda(role):
-    conn = boto3.client("lambda", "us-west-2")
+    conn = boto3.client("lambda", _lambda_region)
     zip_content = get_test_zip_file1()
     with assert_raises(ClientError) as err:
         conn.create_function(
@@ -1548,7 +1733,7 @@ def create_invalid_lambda(role):
 
 def get_role_name():
     with mock_iam():
-        iam = boto3.client("iam", region_name="us-west-2")
+        iam = boto3.client("iam", region_name=_lambda_region)
         try:
             return iam.get_role(RoleName="my-role")["Role"]["Arn"]
         except ClientError:

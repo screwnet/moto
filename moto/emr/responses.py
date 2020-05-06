@@ -10,9 +10,10 @@ from six.moves.urllib.parse import urlparse
 from moto.core.responses import AWSServiceSpec
 from moto.core.responses import BaseResponse
 from moto.core.responses import xml_to_json_response
+from moto.core.utils import tags_from_query_string
 from .exceptions import EmrError
 from .models import emr_backends
-from .utils import steps_from_query_string, tags_from_query_string
+from .utils import steps_from_query_string
 
 
 def generate_boto3_response(operation):
@@ -73,6 +74,8 @@ class ElasticMapReduceResponse(BaseResponse):
         instance_groups = self._get_list_prefix("InstanceGroups.member")
         for item in instance_groups:
             item["instance_count"] = int(item["instance_count"])
+            # Adding support to EbsConfiguration
+            self._parse_ebs_configuration(item)
         instance_groups = self.backend.add_instance_groups(jobflow_id, instance_groups)
         template = self.response_template(ADD_INSTANCE_GROUPS_TEMPLATE)
         return template.render(instance_groups=instance_groups)
@@ -89,7 +92,7 @@ class ElasticMapReduceResponse(BaseResponse):
     @generate_boto3_response("AddTags")
     def add_tags(self):
         cluster_id = self._get_param("ResourceId")
-        tags = tags_from_query_string(self.querystring)
+        tags = tags_from_query_string(self.querystring, prefix="Tags")
         self.backend.add_tags(cluster_id, tags)
         template = self.response_template(ADD_TAGS_TEMPLATE)
         return template.render()
@@ -324,6 +327,8 @@ class ElasticMapReduceResponse(BaseResponse):
         if instance_groups:
             for ig in instance_groups:
                 ig["instance_count"] = int(ig["instance_count"])
+                # Adding support to EbsConfiguration
+                self._parse_ebs_configuration(ig)
             self.backend.add_instance_groups(cluster.id, instance_groups)
 
         tags = self._get_list_prefix("Tags.member")
@@ -334,6 +339,85 @@ class ElasticMapReduceResponse(BaseResponse):
 
         template = self.response_template(RUN_JOB_FLOW_TEMPLATE)
         return template.render(cluster=cluster)
+
+    def _has_key_prefix(self, key_prefix, value):
+        for key in value:  # iter on both keys and values
+            if key.startswith(key_prefix):
+                return True
+        return False
+
+    def _parse_ebs_configuration(self, instance_group):
+        key_ebs_config = "ebs_configuration"
+        ebs_configuration = dict()
+        # Filter only EBS config keys
+        for key in instance_group:
+            if key.startswith(key_ebs_config):
+                ebs_configuration[key] = instance_group[key]
+
+        if len(ebs_configuration) > 0:
+            # Key that should be extracted
+            ebs_optimized = "ebs_optimized"
+            ebs_block_device_configs = "ebs_block_device_configs"
+            volume_specification = "volume_specification"
+            size_in_gb = "size_in_gb"
+            volume_type = "volume_type"
+            iops = "iops"
+            volumes_per_instance = "volumes_per_instance"
+
+            key_ebs_optimized = "{0}._{1}".format(key_ebs_config, ebs_optimized)
+            # EbsOptimized config
+            if key_ebs_optimized in ebs_configuration:
+                instance_group.pop(key_ebs_optimized)
+                ebs_configuration[ebs_optimized] = ebs_configuration.pop(
+                    key_ebs_optimized
+                )
+
+            # Ebs Blocks
+            ebs_blocks = []
+            idx = 1
+            keyfmt = "{0}._{1}.member.{{}}".format(
+                key_ebs_config, ebs_block_device_configs
+            )
+            key = keyfmt.format(idx)
+            while self._has_key_prefix(key, ebs_configuration):
+                vlespc_keyfmt = "{0}._{1}._{{}}".format(key, volume_specification)
+                vol_size = vlespc_keyfmt.format(size_in_gb)
+                vol_iops = vlespc_keyfmt.format(iops)
+                vol_type = vlespc_keyfmt.format(volume_type)
+
+                ebs_block = dict()
+                ebs_block[volume_specification] = dict()
+                if vol_size in ebs_configuration:
+                    instance_group.pop(vol_size)
+                    ebs_block[volume_specification][size_in_gb] = int(
+                        ebs_configuration.pop(vol_size)
+                    )
+                if vol_iops in ebs_configuration:
+                    instance_group.pop(vol_iops)
+                    ebs_block[volume_specification][iops] = ebs_configuration.pop(
+                        vol_iops
+                    )
+                if vol_type in ebs_configuration:
+                    instance_group.pop(vol_type)
+                    ebs_block[volume_specification][
+                        volume_type
+                    ] = ebs_configuration.pop(vol_type)
+
+                per_instance = "{0}._{1}".format(key, volumes_per_instance)
+                if per_instance in ebs_configuration:
+                    instance_group.pop(per_instance)
+                    ebs_block[volumes_per_instance] = int(
+                        ebs_configuration.pop(per_instance)
+                    )
+
+                if len(ebs_block) > 0:
+                    ebs_blocks.append(ebs_block)
+                idx += 1
+                key = keyfmt.format(idx)
+
+            if len(ebs_blocks) > 0:
+                ebs_configuration[ebs_block_device_configs] = ebs_blocks
+            instance_group[key_ebs_config] = ebs_configuration
 
     @generate_boto3_response("SetTerminationProtection")
     def set_termination_protection(self):
@@ -754,7 +838,22 @@ LIST_INSTANCE_GROUPS_TEMPLATE = """<ListInstanceGroupsResponse xmlns="http://ela
         <BidPrice>{{ instance_group.bid_price }}</BidPrice>
         {% endif %}
         <Configurations/>
-        <EbsBlockDevices/>
+        {% if instance_group.ebs_configuration is not none %}
+        <EbsBlockDevices>
+            {% for ebs_block_device in instance_group.ebs_configuration.ebs_block_device_configs %}
+              {% for i in range(ebs_block_device.volumes_per_instance) %}
+          <member>
+            <VolumeSpecification>
+              <VolumeType>{{ebs_block_device.volume_specification.volume_type}}</VolumeType>
+              <Iops>{{ebs_block_device.volume_specification.iops}}</Iops>
+              <SizeInGB>{{ebs_block_device.volume_specification.size_in_gb}}</SizeInGB>
+            </VolumeSpecification>
+            <Device>/dev/sd{{i}}</Device>
+          </member>
+              {% endfor %}
+            {% endfor %}
+        </EbsBlockDevices>
+        {% endif %}
         {% if instance_group.ebs_optimized is not none %}
         <EbsOptimized>{{ instance_group.ebs_optimized }}</EbsOptimized>
         {% endif %}
@@ -835,7 +934,7 @@ LIST_STEPS_TEMPLATE = """<ListStepsResponse xmlns="http://elasticmapreduce.amazo
             {% if step.end_datetime is not none %}
             <EndDateTime>{{ step.end_datetime.isoformat() }}</EndDateTime>
             {% endif %}
-            {% if step.ready_datetime is not none %}
+            {% if step.start_datetime is not none %}
             <StartDateTime>{{ step.start_datetime.isoformat() }}</StartDateTime>
             {% endif %}
           </Timeline>

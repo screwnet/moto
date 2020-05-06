@@ -6,18 +6,24 @@ import decimal
 import json
 import re
 import uuid
-import six
 
 from boto3 import Session
-from botocore.exceptions import ParamValidationError
 from moto.compat import OrderedDict
 from moto.core import BaseBackend, BaseModel
 from moto.core.utils import unix_time
 from moto.core.exceptions import JsonRESTError
-from .comparisons import get_comparison_func
-from .comparisons import get_filter_expression
-from .comparisons import get_expected
-from .exceptions import InvalidIndexNameError, InvalidUpdateExpression, ItemSizeTooLarge
+from moto.dynamodb2.comparisons import get_filter_expression
+from moto.dynamodb2.comparisons import get_expected
+from moto.dynamodb2.exceptions import (
+    InvalidIndexNameError,
+    ItemSizeTooLarge,
+    ItemSizeToUpdateTooLarge,
+)
+from moto.dynamodb2.models.utilities import bytesize
+from moto.dynamodb2.models.dynamo_type import DynamoType
+from moto.dynamodb2.parsing.executors import UpdateExpressionExecutor
+from moto.dynamodb2.parsing.expressions import UpdateExpressionParser
+from moto.dynamodb2.parsing.validators import UpdateExpressionValidator
 
 
 class DynamoJsonEncoder(json.JSONEncoder):
@@ -28,220 +34,6 @@ class DynamoJsonEncoder(json.JSONEncoder):
 
 def dynamo_json_dump(dynamo_object):
     return json.dumps(dynamo_object, cls=DynamoJsonEncoder)
-
-
-def bytesize(val):
-    return len(str(val).encode("utf-8"))
-
-
-def attribute_is_list(attr):
-    """
-    Checks if attribute denotes a list, and returns the name of the list and the given list index if so
-    :param attr: attr or attr[index]
-    :return: attr, index or None
-    """
-    list_index_update = re.match("(.+)\\[([0-9]+)\\]", attr)
-    if list_index_update:
-        attr = list_index_update.group(1)
-    return attr, list_index_update.group(2) if list_index_update else None
-
-
-class DynamoType(object):
-    """
-    http://docs.aws.amazon.com/amazondynamodb/latest/developerguide/DataModel.html#DataModelDataTypes
-    """
-
-    def __init__(self, type_as_dict):
-        if type(type_as_dict) == DynamoType:
-            self.type = type_as_dict.type
-            self.value = type_as_dict.value
-        else:
-            self.type = list(type_as_dict)[0]
-            self.value = list(type_as_dict.values())[0]
-        if self.is_list():
-            self.value = [DynamoType(val) for val in self.value]
-        elif self.is_map():
-            self.value = dict((k, DynamoType(v)) for k, v in self.value.items())
-
-    def get(self, key):
-        if not key:
-            return self
-        else:
-            key_head = key.split(".")[0]
-            key_tail = ".".join(key.split(".")[1:])
-            if key_head not in self.value:
-                self.value[key_head] = DynamoType({"NONE": None})
-            return self.value[key_head].get(key_tail)
-
-    def set(self, key, new_value, index=None):
-        if index:
-            index = int(index)
-            if type(self.value) is not list:
-                raise InvalidUpdateExpression
-            if index >= len(self.value):
-                self.value.append(new_value)
-            # {'L': [DynamoType, ..]} ==> DynamoType.set()
-            self.value[min(index, len(self.value) - 1)].set(key, new_value)
-        else:
-            attr = (key or "").split(".").pop(0)
-            attr, list_index = attribute_is_list(attr)
-            if not key:
-                # {'S': value} ==> {'S': new_value}
-                self.type = new_value.type
-                self.value = new_value.value
-            else:
-                if attr not in self.value:  # nonexistingattribute
-                    type_of_new_attr = "M" if "." in key else new_value.type
-                    self.value[attr] = DynamoType({type_of_new_attr: {}})
-                # {'M': {'foo': DynamoType}} ==> DynamoType.set(new_value)
-                self.value[attr].set(
-                    ".".join(key.split(".")[1:]), new_value, list_index
-                )
-
-    def delete(self, key, index=None):
-        if index:
-            if not key:
-                if int(index) < len(self.value):
-                    del self.value[int(index)]
-            elif "." in key:
-                self.value[int(index)].delete(".".join(key.split(".")[1:]))
-            else:
-                self.value[int(index)].delete(key)
-        else:
-            attr = key.split(".")[0]
-            attr, list_index = attribute_is_list(attr)
-
-            if list_index:
-                self.value[attr].delete(".".join(key.split(".")[1:]), list_index)
-            elif "." in key:
-                self.value[attr].delete(".".join(key.split(".")[1:]))
-            else:
-                self.value.pop(key)
-
-    def filter(self, projection_expressions):
-        nested_projections = [
-            expr[0 : expr.index(".")] for expr in projection_expressions if "." in expr
-        ]
-        if self.is_map():
-            expressions_to_delete = []
-            for attr in self.value:
-                if (
-                    attr not in projection_expressions
-                    and attr not in nested_projections
-                ):
-                    expressions_to_delete.append(attr)
-                elif attr in nested_projections:
-                    relevant_expressions = [
-                        expr[len(attr + ".") :]
-                        for expr in projection_expressions
-                        if expr.startswith(attr + ".")
-                    ]
-                    self.value[attr].filter(relevant_expressions)
-            for expr in expressions_to_delete:
-                self.value.pop(expr)
-
-    def __hash__(self):
-        return hash((self.type, self.value))
-
-    def __eq__(self, other):
-        return self.type == other.type and self.value == other.value
-
-    def __lt__(self, other):
-        return self.cast_value < other.cast_value
-
-    def __le__(self, other):
-        return self.cast_value <= other.cast_value
-
-    def __gt__(self, other):
-        return self.cast_value > other.cast_value
-
-    def __ge__(self, other):
-        return self.cast_value >= other.cast_value
-
-    def __repr__(self):
-        return "DynamoType: {0}".format(self.to_json())
-
-    @property
-    def cast_value(self):
-        if self.is_number():
-            try:
-                return int(self.value)
-            except ValueError:
-                return float(self.value)
-        elif self.is_set():
-            sub_type = self.type[0]
-            return set([DynamoType({sub_type: v}).cast_value for v in self.value])
-        elif self.is_list():
-            return [DynamoType(v).cast_value for v in self.value]
-        elif self.is_map():
-            return dict([(k, DynamoType(v).cast_value) for k, v in self.value.items()])
-        else:
-            return self.value
-
-    def child_attr(self, key):
-        """
-        Get Map or List children by key. str for Map, int for List.
-
-        Returns DynamoType or None.
-        """
-        if isinstance(key, six.string_types) and self.is_map():
-            if "." in key and key.split(".")[0] in self.value:
-                return self.value[key.split(".")[0]].child_attr(
-                    ".".join(key.split(".")[1:])
-                )
-            elif "." not in key and key in self.value:
-                return DynamoType(self.value[key])
-
-        if isinstance(key, int) and self.is_list():
-            idx = key
-            if 0 <= idx < len(self.value):
-                return DynamoType(self.value[idx])
-
-        return None
-
-    def size(self):
-        if self.is_number():
-            value_size = len(str(self.value))
-        elif self.is_set():
-            sub_type = self.type[0]
-            value_size = sum([DynamoType({sub_type: v}).size() for v in self.value])
-        elif self.is_list():
-            value_size = sum([v.size() for v in self.value])
-        elif self.is_map():
-            value_size = sum(
-                [bytesize(k) + DynamoType(v).size() for k, v in self.value.items()]
-            )
-        elif type(self.value) == bool:
-            value_size = 1
-        else:
-            value_size = bytesize(self.value)
-        return value_size
-
-    def to_json(self):
-        return {self.type: self.value}
-
-    def compare(self, range_comparison, range_objs):
-        """
-        Compares this type against comparison filters
-        """
-        range_values = [obj.cast_value for obj in range_objs]
-        comparison_func = get_comparison_func(range_comparison)
-        return comparison_func(self.cast_value, *range_values)
-
-    def is_number(self):
-        return self.type == "N"
-
-    def is_set(self):
-        return self.type == "SS" or self.type == "NS" or self.type == "BS"
-
-    def is_list(self):
-        return self.type == "L"
-
-    def is_map(self):
-        return self.type == "M"
-
-    def same_type(self, other):
-        return self.type == other.type
 
 
 # https://github.com/spulec/moto/issues/1874
@@ -279,8 +71,22 @@ class Item(BaseModel):
         for key, value in attrs.items():
             self.attrs[key] = DynamoType(value)
 
+    def __eq__(self, other):
+        return all(
+            [
+                self.hash_key == other.hash_key,
+                self.hash_key_type == other.hash_key_type,
+                self.range_key == other.range_key,
+                self.range_key_type == other.range_key_type,
+                self.attrs == other.attrs,
+            ]
+        )
+
     def __repr__(self):
         return "Item: {0}".format(self.to_json())
+
+    def size(self):
+        return sum(bytesize(key) + value.size() for key, value in self.attrs.items())
 
     def to_json(self):
         attributes = {}
@@ -298,184 +104,6 @@ class Item(BaseModel):
         else:
             included = self.attrs
         return {"Item": included}
-
-    def update(
-        self, update_expression, expression_attribute_names, expression_attribute_values
-    ):
-        # Update subexpressions are identifiable by the operator keyword, so split on that and
-        # get rid of the empty leading string.
-        parts = [
-            p
-            for p in re.split(
-                r"\b(SET|REMOVE|ADD|DELETE)\b", update_expression, flags=re.I
-            )
-            if p
-        ]
-        # make sure that we correctly found only operator/value pairs
-        assert (
-            len(parts) % 2 == 0
-        ), "Mismatched operators and values in update expression: '{}'".format(
-            update_expression
-        )
-        for action, valstr in zip(parts[:-1:2], parts[1::2]):
-            action = action.upper()
-
-            # "Should" retain arguments in side (...)
-            values = re.split(r",(?![^(]*\))", valstr)
-            for value in values:
-                # A Real value
-                value = value.lstrip(":").rstrip(",").strip()
-                for k, v in expression_attribute_names.items():
-                    value = re.sub(r"{0}\b".format(k), v, value)
-
-                if action == "REMOVE":
-                    key = value
-                    attr, list_index = attribute_is_list(key.split(".")[0])
-                    if "." not in key:
-                        if list_index:
-                            new_list = DynamoType(self.attrs[attr])
-                            new_list.delete(None, list_index)
-                            self.attrs[attr] = new_list
-                        else:
-                            self.attrs.pop(value, None)
-                    else:
-                        # Handle nested dict updates
-                        self.attrs[attr].delete(".".join(key.split(".")[1:]))
-                elif action == "SET":
-                    key, value = value.split("=", 1)
-                    key = key.strip()
-                    value = value.strip()
-
-                    # check whether key is a list
-                    attr, list_index = attribute_is_list(key.split(".")[0])
-                    # If value not exists, changes value to a default if needed, else its the same as it was
-                    value = self._get_default(value)
-                    # If operation == list_append, get the original value and append it
-                    value = self._get_appended_list(value, expression_attribute_values)
-
-                    if type(value) != DynamoType:
-                        if value in expression_attribute_values:
-                            dyn_value = DynamoType(expression_attribute_values[value])
-                        else:
-                            dyn_value = DynamoType({"S": value})
-                    else:
-                        dyn_value = value
-
-                    if "." in key and attr not in self.attrs:
-                        raise ValueError  # Setting nested attr not allowed if first attr does not exist yet
-                    elif attr not in self.attrs:
-                        self.attrs[attr] = dyn_value  # set new top-level attribute
-                    else:
-                        self.attrs[attr].set(
-                            ".".join(key.split(".")[1:]), dyn_value, list_index
-                        )  # set value recursively
-
-                elif action == "ADD":
-                    key, value = value.split(" ", 1)
-                    key = key.strip()
-                    value_str = value.strip()
-                    if value_str in expression_attribute_values:
-                        dyn_value = DynamoType(expression_attribute_values[value])
-                    else:
-                        raise TypeError
-
-                    # Handle adding numbers - value gets added to existing value,
-                    # or added to 0 if it doesn't exist yet
-                    if dyn_value.is_number():
-                        existing = self.attrs.get(key, DynamoType({"N": "0"}))
-                        if not existing.same_type(dyn_value):
-                            raise TypeError()
-                        self.attrs[key] = DynamoType(
-                            {
-                                "N": str(
-                                    decimal.Decimal(existing.value)
-                                    + decimal.Decimal(dyn_value.value)
-                                )
-                            }
-                        )
-
-                    # Handle adding sets - value is added to the set, or set is
-                    # created with only this value if it doesn't exist yet
-                    # New value must be of same set type as previous value
-                    elif dyn_value.is_set():
-                        key_head = key.split(".")[0]
-                        key_tail = ".".join(key.split(".")[1:])
-                        if key_head not in self.attrs:
-                            self.attrs[key_head] = DynamoType({dyn_value.type: {}})
-                        existing = self.attrs.get(key_head)
-                        existing = existing.get(key_tail)
-                        if existing.value and not existing.same_type(dyn_value):
-                            raise TypeError()
-                        new_set = set(existing.value or []).union(dyn_value.value)
-                        existing.set(
-                            key=None,
-                            new_value=DynamoType({dyn_value.type: list(new_set)}),
-                        )
-                    else:  # Number and Sets are the only supported types for ADD
-                        raise TypeError
-
-                elif action == "DELETE":
-                    key, value = value.split(" ", 1)
-                    key = key.strip()
-                    value_str = value.strip()
-                    if value_str in expression_attribute_values:
-                        dyn_value = DynamoType(expression_attribute_values[value])
-                    else:
-                        raise TypeError
-
-                    if not dyn_value.is_set():
-                        raise TypeError
-                    key_head = key.split(".")[0]
-                    key_tail = ".".join(key.split(".")[1:])
-                    existing = self.attrs.get(key_head)
-                    existing = existing.get(key_tail)
-                    if existing:
-                        if not existing.same_type(dyn_value):
-                            raise TypeError
-                        new_set = set(existing.value).difference(dyn_value.value)
-                        existing.set(
-                            key=None,
-                            new_value=DynamoType({existing.type: list(new_set)}),
-                        )
-                else:
-                    raise NotImplementedError(
-                        "{} update action not yet supported".format(action)
-                    )
-
-    def _get_appended_list(self, value, expression_attribute_values):
-        if type(value) != DynamoType:
-            list_append_re = re.match("list_append\\((.+),(.+)\\)", value)
-            if list_append_re:
-                new_value = expression_attribute_values[list_append_re.group(2).strip()]
-                old_list_key = list_append_re.group(1)
-                # Get the existing value
-                old_list = self.attrs[old_list_key.split(".")[0]]
-                if "." in old_list_key:
-                    # Value is nested inside a map - find the appropriate child attr
-                    old_list = old_list.child_attr(
-                        ".".join(old_list_key.split(".")[1:])
-                    )
-                if not old_list.is_list():
-                    raise ParamValidationError
-                old_list.value.extend(new_value["L"])
-                value = old_list
-        return value
-
-    def _get_default(self, value):
-        if value.startswith("if_not_exists"):
-            # Function signature
-            match = re.match(
-                r".*if_not_exists\s*\((?P<path>.+),\s*(?P<default>.+)\).*", value
-            )
-            if not match:
-                raise TypeError
-
-            path, value = match.groups()
-
-            # If it already exists, get its value so we dont overwrite it
-            if path in self.attrs:
-                value = self.attrs[path]
-        return value
 
     def update_with_attribute_updates(self, attribute_updates):
         for attribute_name, update_action in attribute_updates.items():
@@ -674,6 +302,10 @@ class Table(BaseModel):
         self.throughput["NumberOfDecreasesToday"] = 0
         self.indexes = indexes
         self.global_indexes = global_indexes if global_indexes else []
+        for index in self.global_indexes:
+            index[
+                "IndexStatus"
+            ] = "ACTIVE"  # One of 'CREATING'|'UPDATING'|'DELETING'|'ACTIVE'
         self.created_at = datetime.datetime.utcnow()
         self.items = defaultdict(dict)
         self.table_arn = self._generate_arn(table_name)
@@ -787,8 +419,20 @@ class Table(BaseModel):
         expression_attribute_values=None,
         overwrite=False,
     ):
+        if self.hash_key_attr not in item_attrs.keys():
+            raise KeyError(
+                "One or more parameter values were invalid: Missing the key "
+                + self.hash_key_attr
+                + " in the item"
+            )
         hash_value = DynamoType(item_attrs.get(self.hash_key_attr))
         if self.has_range_key:
+            if self.range_key_attr not in item_attrs.keys():
+                raise KeyError(
+                    "One or more parameter values were invalid: Missing the key "
+                    + self.range_key_attr
+                    + " in the item"
+                )
             range_value = DynamoType(item_attrs.get(self.range_key_attr))
         else:
             range_value = None
@@ -803,7 +447,6 @@ class Table(BaseModel):
             else:
                 lookup_range_value = DynamoType(expected_range_value)
         current = self.get_item(hash_value, lookup_range_value)
-
         item = Item(
             hash_value, self.hash_key_type, range_value, self.range_key_type, item_attrs
         )
@@ -971,8 +614,13 @@ class Table(BaseModel):
         if index_name:
 
             if index_range_key:
+
+                # Convert to float if necessary to ensure proper ordering
+                def conv(x):
+                    return float(x.value) if x.type == "N" else x.value
+
                 results.sort(
-                    key=lambda item: item.attrs[index_range_key["AttributeName"]].value
+                    key=lambda item: conv(item.attrs[index_range_key["AttributeName"]])
                     if item.attrs.get(index_range_key["AttributeName"])
                     else None
                 )
@@ -1101,6 +749,14 @@ class Table(BaseModel):
                     break
 
         last_evaluated_key = None
+        size_limit = 1000000  # DynamoDB has a 1MB size limit
+        item_size = sum(res.size() for res in results)
+        if item_size > size_limit:
+            item_size = idx = 0
+            while item_size + results[idx].size() < size_limit:
+                item_size += results[idx].size()
+                idx += 1
+            limit = min(limit, idx) if limit else idx
         if limit and len(results) > limit:
             results = results[:limit]
             last_evaluated_key = {self.hash_key_attr: results[-1].hash_key}
@@ -1378,13 +1034,20 @@ class DynamoDBBackend(BaseBackend):
         table_name,
         key,
         update_expression,
-        attribute_updates,
         expression_attribute_names,
         expression_attribute_values,
+        attribute_updates=None,
         expected=None,
         condition_expression=None,
     ):
         table = self.get_table(table_name)
+
+        # Support spaces between operators in an update expression
+        # E.g. `a = b + c` -> `a=b+c`
+        if update_expression:
+            # Parse expression to get validation errors
+            update_expression_ast = UpdateExpressionParser.make(update_expression)
+            update_expression = re.sub(r"\s*([=\+-])\s*", "\\1", update_expression)
 
         if all([table.hash_key_attr in key, table.range_key_attr in key]):
             # Covers cases where table has hash and range keys, ``key`` param
@@ -1401,6 +1064,7 @@ class DynamoDBBackend(BaseBackend):
             range_value = None
 
         item = table.get_item(hash_value, range_value)
+        orig_item = copy.deepcopy(item)
 
         if not expected:
             expected = {}
@@ -1427,13 +1091,22 @@ class DynamoDBBackend(BaseBackend):
             item = table.get_item(hash_value, range_value)
 
         if update_expression:
-            item.update(
-                update_expression,
-                expression_attribute_names,
-                expression_attribute_values,
-            )
+            validated_ast = UpdateExpressionValidator(
+                update_expression_ast,
+                expression_attribute_names=expression_attribute_names,
+                expression_attribute_values=expression_attribute_values,
+                item=item,
+            ).validate()
+            try:
+                UpdateExpressionExecutor(
+                    validated_ast, item, expression_attribute_names
+                ).execute()
+            except ItemSizeTooLarge:
+                raise ItemSizeToUpdateTooLarge()
         else:
             item.update_with_attribute_updates(attribute_updates)
+        if table.stream_shard is not None:
+            table.stream_shard.add(orig_item, item)
         return item
 
     def delete_item(
@@ -1484,6 +1157,94 @@ class DynamoDBBackend(BaseBackend):
             raise JsonRESTError("ResourceNotFound", "Table not found")
 
         return table.ttl
+
+    def transact_write_items(self, transact_items):
+        # Create a backup in case any of the transactions fail
+        original_table_state = copy.deepcopy(self.tables)
+        try:
+            for item in transact_items:
+                if "ConditionCheck" in item:
+                    item = item["ConditionCheck"]
+                    key = item["Key"]
+                    table_name = item["TableName"]
+                    condition_expression = item.get("ConditionExpression", None)
+                    expression_attribute_names = item.get(
+                        "ExpressionAttributeNames", None
+                    )
+                    expression_attribute_values = item.get(
+                        "ExpressionAttributeValues", None
+                    )
+                    current = self.get_item(table_name, key)
+
+                    condition_op = get_filter_expression(
+                        condition_expression,
+                        expression_attribute_names,
+                        expression_attribute_values,
+                    )
+                    if not condition_op.expr(current):
+                        raise ValueError("The conditional request failed")
+                elif "Put" in item:
+                    item = item["Put"]
+                    attrs = item["Item"]
+                    table_name = item["TableName"]
+                    condition_expression = item.get("ConditionExpression", None)
+                    expression_attribute_names = item.get(
+                        "ExpressionAttributeNames", None
+                    )
+                    expression_attribute_values = item.get(
+                        "ExpressionAttributeValues", None
+                    )
+                    self.put_item(
+                        table_name,
+                        attrs,
+                        condition_expression=condition_expression,
+                        expression_attribute_names=expression_attribute_names,
+                        expression_attribute_values=expression_attribute_values,
+                    )
+                elif "Delete" in item:
+                    item = item["Delete"]
+                    key = item["Key"]
+                    table_name = item["TableName"]
+                    condition_expression = item.get("ConditionExpression", None)
+                    expression_attribute_names = item.get(
+                        "ExpressionAttributeNames", None
+                    )
+                    expression_attribute_values = item.get(
+                        "ExpressionAttributeValues", None
+                    )
+                    self.delete_item(
+                        table_name,
+                        key,
+                        condition_expression=condition_expression,
+                        expression_attribute_names=expression_attribute_names,
+                        expression_attribute_values=expression_attribute_values,
+                    )
+                elif "Update" in item:
+                    item = item["Update"]
+                    key = item["Key"]
+                    table_name = item["TableName"]
+                    update_expression = item["UpdateExpression"]
+                    condition_expression = item.get("ConditionExpression", None)
+                    expression_attribute_names = item.get(
+                        "ExpressionAttributeNames", None
+                    )
+                    expression_attribute_values = item.get(
+                        "ExpressionAttributeValues", None
+                    )
+                    self.update_item(
+                        table_name,
+                        key,
+                        update_expression=update_expression,
+                        condition_expression=condition_expression,
+                        expression_attribute_names=expression_attribute_names,
+                        expression_attribute_values=expression_attribute_values,
+                    )
+                else:
+                    raise ValueError
+        except:  # noqa: E722 Do not use bare except
+            # Rollback to the original state, and reraise the error
+            self.tables = original_table_state
+            raise
 
 
 dynamodb_backends = {}

@@ -28,6 +28,7 @@ class CloudWatchResponse(BaseResponse):
         dimensions = self._get_list_prefix("Dimensions.member")
         alarm_actions = self._get_multi_param("AlarmActions.member")
         ok_actions = self._get_multi_param("OKActions.member")
+        actions_enabled = self._get_param("ActionsEnabled")
         insufficient_data_actions = self._get_multi_param(
             "InsufficientDataActions.member"
         )
@@ -47,6 +48,7 @@ class CloudWatchResponse(BaseResponse):
             ok_actions,
             insufficient_data_actions,
             unit,
+            actions_enabled,
         )
         template = self.response_template(PUT_METRIC_ALARM_TEMPLATE)
         return template.render(alarm=alarm)
@@ -91,6 +93,18 @@ class CloudWatchResponse(BaseResponse):
         return template.render()
 
     @amzn_request_id
+    def get_metric_data(self):
+        start = dtparse(self._get_param("StartTime"))
+        end = dtparse(self._get_param("EndTime"))
+        queries = self._get_list_prefix("MetricDataQueries.member")
+        results = self.cloudwatch_backend.get_metric_data(
+            start_time=start, end_time=end, queries=queries
+        )
+
+        template = self.response_template(GET_METRIC_DATA_TEMPLATE)
+        return template.render(results=results)
+
+    @amzn_request_id
     def get_metric_statistics(self):
         namespace = self._get_param("Namespace")
         metric_name = self._get_param("MetricName")
@@ -122,9 +136,10 @@ class CloudWatchResponse(BaseResponse):
     def list_metrics(self):
         namespace = self._get_param("Namespace")
         metric_name = self._get_param("MetricName")
+        dimensions = self._get_multi_param("Dimensions.member")
         next_token = self._get_param("NextToken")
         next_token, metrics = self.cloudwatch_backend.list_metrics(
-            next_token, namespace, metric_name
+            next_token, namespace, metric_name, dimensions
         )
         template = self.response_template(LIST_METRICS_TEMPLATE)
         return template.render(metrics=metrics, next_token=next_token)
@@ -282,6 +297,35 @@ PUT_METRIC_DATA_TEMPLATE = """<PutMetricDataResponse xmlns="http://monitoring.am
       </RequestId>
    </ResponseMetadata>
 </PutMetricDataResponse>"""
+
+GET_METRIC_DATA_TEMPLATE = """<GetMetricDataResponse xmlns="http://monitoring.amazonaws.com/doc/2010-08-01/">
+   <ResponseMetadata>
+      <RequestId>
+         {{ request_id }}
+      </RequestId>
+   </ResponseMetadata>
+   <GetMetricDataResult>
+       <MetricDataResults>
+           {% for result in results %}
+            <member>
+                <Id>{{ result.id }}</Id>
+                <Label>{{ result.label }}</Label>
+                <StatusCode>Complete</StatusCode>
+                <Timestamps>
+                    {% for val in result.timestamps %}
+                    <member>{{ val }}</member>
+                    {% endfor %}
+                </Timestamps>
+                <Values>
+                    {% for val in result.vals %}
+                    <member>{{ val }}</member>
+                    {% endfor %}
+                </Values>
+            </member>
+            {% endfor %}
+       </MetricDataResults>
+   </GetMetricDataResult>
+</GetMetricDataResponse>"""
 
 GET_METRIC_STATISTICS_TEMPLATE = """<GetMetricStatisticsResponse xmlns="http://monitoring.amazonaws.com/doc/2010-08-01/">
    <ResponseMetadata>

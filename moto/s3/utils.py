@@ -35,9 +35,20 @@ def bucket_name_from_url(url):
             return None
 
 
+# 'owi-common-cf', 'snippets/test.json' = bucket_and_name_from_url('s3://owi-common-cf/snippets/test.json')
+def bucket_and_name_from_url(url):
+    prefix = "s3://"
+    if url.startswith(prefix):
+        bucket_name = url[len(prefix) : url.index("/", len(prefix))]
+        key = url[url.index("/", len(prefix)) + 1 :]
+        return bucket_name, key
+    else:
+        return None, None
+
+
 REGION_URL_REGEX = re.compile(
     r"^https?://(s3[-\.](?P<region1>.+)\.amazonaws\.com/(.+)|"
-    r"(.+)\.s3-(?P<region2>.+)\.amazonaws\.com)/?"
+    r"(.+)\.s3[-\.](?P<region2>.+)\.amazonaws\.com)/?"
 )
 
 
@@ -52,7 +63,7 @@ def parse_region_from_url(url):
 
 def metadata_from_headers(headers):
     metadata = {}
-    meta_regex = re.compile("^x-amz-meta-([a-zA-Z0-9\-_]+)$", flags=re.IGNORECASE)
+    meta_regex = re.compile(r"^x-amz-meta-([a-zA-Z0-9\-_]+)$", flags=re.IGNORECASE)
     for header, value in headers.items():
         if isinstance(header, six.string_types):
             result = meta_regex.match(header)
@@ -134,6 +145,12 @@ class _VersionedKeyStore(dict):
     def _iterlists(self):
         for key in self:
             yield key, self.getlist(key)
+
+    def item_size(self):
+        size = 0
+        for val in self.values():
+            size += sys.getsizeof(val)
+        return size
 
     items = iteritems = _iteritems
     lists = iterlists = _iterlists
